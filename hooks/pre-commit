@@ -1,16 +1,16 @@
 #!/bin/sh
-# folder-lock pre-commit guard. Two checks, both fail OPEN on infrastructure
-# errors (a broken guard must never brick commits - it must be LOUD instead):
-#   check_locks.py   - refuse staged paths under another session's fresh folder lock
-#   protect_main.py  - refuse direct commits to main/master (MAIN_COMMIT_OK=1 to override)
-# Both scripts live next to this file so core.hooksPath can point anywhere.
+# folder-lock pre-commit guard. Two checks. Both FAIL CLOSED: a guard that cannot run
+# refuses the commit and says so (PROTOCOL.md §10) — loudly broken beats silently permissive.
+#   check_locks.py   - refuse staged paths under another window's fresh lock, unclaimed or unguarded folders,
+#                      missing identity, broken wiring
+#   protect_main.py  - refuse plain commits on main/master (MAIN_COMMIT_OK=1 to override)
 HERE=$(dirname "$0")
 if command -v py >/dev/null 2>&1; then PY="py -3"
 elif command -v python3 >/dev/null 2>&1; then PY="python3"
 elif command -v python >/dev/null 2>&1; then PY="python"
 else
-  echo "[folder-lock] WARNING: no python found - allowing commit." >&2
-  exit 0
+  echo "[folder-lock] REFUSED - no python found; the guards cannot run, so the commit does not either." >&2
+  exit 1
 fi
 $PY "$HERE/check_locks.py" || exit 1
 $PY "$HERE/protect_main.py" || exit 1

@@ -1,3 +1,4 @@
 **/.goal/
 __pycache__/
 *.pyc
+.selftest/

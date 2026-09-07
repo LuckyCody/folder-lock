@@ -1,52 +1,63 @@
 # Folder-lock protocol — many agents, one repo, no conflicting saves
 
-One page. Every workfolder's front door (CLAUDE.md / AGENTS.md / README) references this file with one line; the rules are never pasted per folder. Written for humans and agents alike — an agent reads this the same way a new teammate does.
+One page. Every workfolder's front door (CLAUDE.md / AGENTS.md / README) references this file with one line; the rules are never pasted per folder. Written for humans and agents alike. **Every rule below that a program can check IS checked by a program** (§10) — a rule that lives only as text gets skipped the moment a task feels small.
 
 The core idea: **the unit of coordination is the folder, not the task, not the project, not the agent.** A task is too small (five tasks in one folder would mean five locks). A project is too big (one project spans folders other streams need). A folder is where files actually collide, so that is where the lock lives.
 
 ## 1. The folder lock — strict, one per folder
 
-One mutual-exclusion domain per workfolder, carried by two files inside the folder's `.goal/` dir (create it if absent):
+One mutual-exclusion domain per workfolder, two carrier files inside the folder's `.goal/` dir (`lock.py claim` creates it):
 
-- `LOCK.yaml` — interactive sessions (a human + an agent in a terminal). Stale after **24 h**.
-- `.firing.lock` — auto-fired headless agents. Stale after **15 min**.
+- `LOCK.yaml` — interactive sessions. Stale after **24 h**.
+- `.firing.lock` — headless agents launched by a runner. Stale after **15 min**.
 
-They exclude each other: a headless runner skips any folder holding a fresh `LOCK.yaml`; an interactive session treats a fresh `.firing.lock` as "an agent holds this folder".
+They exclude each other: a runner skips any folder holding a fresh `LOCK.yaml`; an interactive session treats a fresh `.firing.lock` as "an agent holds this folder".
 
-**Session first act in a workfolder:** check both files (`python scripts/lock.py check <folder>`).
+**Which folder?** By the PATH being touched, never by keyword. With a registry (`.folder-lock/registry.yaml`, `workflows: - id / owns: [globs]`) the path resolves to its workflow's HOME folder (fixed prefix of the first glob; nested workflows → longest match). Top-level files, `.claude/**`, `.github/**` → the repo-root lock `<repo>/.goal/LOCK.yaml`. Unregistered paths → nearest ancestor with `.goal/`; none → **unguarded**, and every guard refuses until the folder is claimed. One implementation: `lib/lockpath.py::resolve` — every guard imports it, so they cannot disagree.
 
-- Fresh lock, not yours → **stop**. Report who/what/since when (it's all in the lock). Never work around it.
-- Stale lock → say so and ask the owner. **Never silently proceed** over a stale lock. A lock is not proof of liveness, so this needs a human call.
-- No lock → take it (`python scripts/lock.py take <folder> --window <name> --task "..."`):
+**Session first act in a workfolder:** `python scripts/lock.py check <folder>`.
+
+- Fresh lock, not yours → **stop**. Report who/what/since when (it's in the lock). Never work around it.
+- Fresh lock with `status: closing` → the holder is **signing off, not stale**. Wait or stage a handoff; never offer takeover.
+- Stale lock → say so and ask the owner. **Never silently proceed** (`--force-stale` only after they agreed).
+- Free → `python scripts/lock.py claim <folder> --task "<one line>" [--stream S] [--hint word]`:
 
 ```yaml
 holder: interactive        # interactive | fired
-window: "<terminal/window name>"   # so "who holds this" matches what the owner sees on the taskbar
+window: "<minted window ID>"   # lib/mint.py — doubles as commit identity (ICM_WINDOW)
+status: open               # open | closing (§9)
 task: "<one line>"
 stream: "<stream/workflow id>"
-branch: "feat/<stream>"    # or the worktree path
-started: "YYYY-MM-DDTHH:MM"
+branch: "feat/<stream>"
+started: "YYYY-MM-DDTHH:MM"   # minted
 ```
 
-**Session last act:** update the folder's `workflow-state/current-pointer.md` (§3) → commit → release the lock. Locks are runtime state: gitignored (`**/.goal/`), never committed.
+**Session last act** is the agent-initiated signoff (§9): `close` → pointer → commit → `release`. Locks are runtime state: gitignored (`**/.goal/`), never committed. One session may hold a second folder's lock only when the owner's task explicitly spans both — `claim` then reuses the session's window so every commit stays attributable; drift into a third folder is still a handoff (§2).
 
-The lock's `window:` doubles as your **commit identity**: the §5 guard lets a commit touch a locked folder only when `ICM_WINDOW=<that window>` is set on the commit command.
+## 1b. Identity — minted, bound, never hand-formatted
 
-Same-folder parallel sessions are **never intentional**. Top-level files (outside every workfolder) fall under a repo-root `.goal/LOCK.yaml`.
+`lib/mint.py` is the ONLY place an identifier is formatted: window IDs (`<hint>-<yymmdd>-<4>`), lock timestamps, handoff names, drop names, agent IDs. Agents call it or go through the writers that call it (`scripts/lock.py`, `scripts/handoff.py`). An agent that types an ID by hand is a defect.
 
-**How the folder is chosen:** by the path you are about to edit, never by keyword similarity. If your repo has a registry of workflows with `owns:` globs, resolve the path against it. If not, the folder is the nearest ancestor that has its own front-door doc. Two workflows that both "touch payroll PDFs" are still two folders.
+| Environment | Identity carrier | Set by |
+|---|---|---|
+| Claude Code (VS Code / CLI), interactive | `<repo>/.goal/sessions/<CLAUDE_CODE_SESSION_ID>.yaml` → `window:` | `lock.py claim` / `adopt`. Claude Code exposes `CLAUDE_CODE_SESSION_ID` to Bash and hands hooks the same value as `session_id` — the binding IS the export, no env var needed |
+| Headless agent launched by a runner | `ICM_WINDOW` (+ `ICM_FOLDER`) in the process env | the runner, from the agent id it wrote into `.firing.lock` |
+| Plain terminal (human, other runner) | `ICM_WINDOW` env var | you |
+
+Both carriers present and different → every guard refuses. **Neither present is an ERROR state**: the edit guard denies, the commit guard refuses, the Stop hook blocks once per prompt with "no window identity". A hand-written pre-guard lock is bound with `python scripts/lock.py adopt <folder>`.
 
 ## 2. Boundary-crossing = handoff, never drift
 
-When your work crosses into another folder's territory: **the lock says stop, the handoff says what to do instead.** Do not edit across the boundary — write a handoff:
+When your work crosses into another folder: **the lock says stop, the handoff says what to do instead.** Do not edit across the boundary (the edit guard refuses anyway):
 
 ```
 python scripts/handoff.py --to <target folder> --task "<one line>" [--mode stage|fire] [--body <file|->]
 ```
 
-- **stage** (default; work that needs a human mid-flight): lands in `<target>/.goal/inbox/*.staged.md`. Whoever next claims the target folder reads its inbox first. If you run a SessionStart hook, inject staged handoffs there.
-- **fire** (mechanical, fully specified work): additionally writes `<target>/.goal/state.yaml` (`status: in_progress`) for a headless goal-runner to pick up. Fire refuses to clobber a live goal and refuses PARKED folders.
-- File-based invocation ONLY. Driving another agent's window with keystrokes is banned — it is unauditable and it breaks the lock model.
+- **stage** (default): lands in `<target>/.goal/inbox/<minted>.staged.md`; whoever next claims the target reads its inbox first.
+- **fire**: additionally writes `<target>/.goal/state.yaml` (`status: in_progress`) for a headless runner. Refuses to clobber a live goal and refuses PARKED folders.
+- File-based invocation ONLY. Driving another agent's window with keystrokes is banned.
+- Every handoff is recorded on the writer's session binding; `lock.py release` refuses while one is orphaned (§9).
 
 ## 3. Per-folder resume — the current pointer
 
@@ -60,40 +71,70 @@ After this: <remaining phases, one line each>
 Resume handle: read this file + workflow.yaml. Domain contract lives in <front door / canon files>.
 ```
 
-The `Next concrete action:` line is **typed**; the board classifies every pointer by it:
-
-- `Next concrete action: <executable step>` — **actionable** (the normal case; ages)
-- `Next concrete action: WHEN <condition> → <action>` — **tripwire**: an armed wait on the world; never counts as procrastination
-- `Next concrete action: PARKED (<date>, owner) — <reason>. Resume: <condition>` — **parked**: owner suspension; leaves the open board; headless runners never touch the folder. Only the owner parks.
-- `Next concrete action: NONE — <what closed>` — **closed**: no open work; codename retires
-- Missing line — **mute**: a defect; rendered as one collapsed board line until fixed
-
-The end-of-session ritual writes the FIRST MOVE into the folder's pointer. The folder is the carrier of its own resume state, so any window — or any agent, or any model — can pick it up cold.
+`Next concrete action:` is **typed**: plain → **actionable**; `WHEN <condition> → <action>` → **tripwire** (never counts as procrastination); `PARKED (<date>, owner) — <reason>. Resume: <condition>` → **parked** (off-board, runners never touch it, only the owner parks); `NONE — <what closed>` → **closed**; missing → **mute** (a defect). The pointer's mtime is the Stop hook's proof that signoff step 2 happened.
 
 ## 4. Two git lanes — defaults, not rulings
 
-- **Feature lane** (anything someone might review): worktree → `feat/*` branch → PR → squash-merge → delete the branch.
-- **Solo lane** (small solo work, docs, run-state): direct commit to main, **explicitly** (`MAIN_COMMIT_OK=1`), staging only your own paths.
+- **Feature lane**: worktree → `feat/*` → PR → squash-merge → delete the branch. Run `python scripts/install.py` in every clone and worktree; `core.hooksPath` does not travel with the code.
+- **Solo lane**: a deliberate small commit on `main` — `MAIN_COMMIT_OK=1`, explicit paths only. `hooks/protect_main.py` refuses a plain commit on `main`/`master`: a "never on main" rule that lives in a context window is skipped the moment a task feels small.
 
-The `protect_main.py` hook refuses a plain commit on `main`/`master`. This is deliberate: a "never work on main" rule that lives only as text in a context window gets skipped the moment a task feels small. Git refusing is not a suggestion, and it does not care which model is in the terminal.
+## 5. Foreign-changes rule — ENFORCED by the commit guard
 
-## 5. Foreign-changes rule — ENFORCED by the lock guard
+A session encountering uncommitted changes it did not make **stops and reports** — never builds on them, never `git add -A` / `git add .` across streams. Stage explicit paths only.
 
-A session encountering uncommitted changes it did not make **stops and reports** — never builds on top of them, never `git add -A` / `git add .` across streams. Stage explicit paths only.
-
-**Enforcement:** the `pre-commit` hook (`check_locks.py`) **blocks any commit whose staged paths lie under another session's fresh `LOCK.yaml`**. Commit as yourself with `ICM_WINDOW=<window> git commit …` (must match the lock's `window:`, case-insensitive). Foreign paths in your index → `git restore --staged <path>`. Owner-approved override only: `ICM_LOCK_BYPASS=1` (state it in the commit message). The guard fails OPEN on infrastructure errors — a broken guard must be loud, never silently permissive — and treats a malformed lock as foreign.
-
-**The hook is only installed when it has been broken on purpose.** `scripts/install.py` sets `core.hooksPath` and then runs `selftest.py`, which builds a throwaway repo and attempts every violation the guard exists to stop. A hook file that exists is not a hook that runs: `core.hooksPath` is per-clone config, an old setting pointing elsewhere silently disables everything. Re-run install in every clone and worktree.
+`hooks/pre-commit` → `check_locks.py` refuses, and says why, when: a staged path sits under another window's fresh lock · under a guarded folder with no fresh lock of yours ("claim first") · in an unguarded folder ("claim it, which creates `.goal/`") · identity is missing or conflicting · the registry exists but is unreadable · **the hook is not actually wired** (git's hook dir ≠ the guard's dir — the silently-disabled case) · any internal error. Commit identity is automatic inside Claude Code (session binding); plain terminals prefix `ICM_WINDOW=<window> git commit …`. Foreign paths in your index → `git restore --staged <path>`. Owner-approved override only: `ICM_LOCK_BYPASS=1` (say so). `check_locks.py --self-test` proves the refusal in a fixture and records `.goal/selftest_last.json`.
 
 ## 6. Dispatcher mode — fresh window, no folder claimed
 
-A fresh session that has not claimed a folder does not improvise. It runs the board (`python scripts/board.py`) — every lock, every pointer, every staged handoff — resolves the owner's ask to a folder by path, then either:
+`python scripts/board.py` — every lock (with `status`), every pointer (typed), every staged handoff. Resolve the ask to a folder by path, then **claim-and-become** (lock → pointer → rename the window to the minted ID → work) or **drop** (stage/fire into the target's `.goal` inbox). Wrong-folder landings self-correct via §2 — the edit guard will not let you improvise in place.
 
-- **claim-and-become**: take the folder lock, read its current pointer, rename the window to match, work; or
-- **drop**: write the task into the target's `.goal` inbox (stage/fire) and report where it landed.
+## 7. Drops
 
-Wrong-folder landings self-correct: if the lock or the registry says you're in the wrong folder, redirect via §2 — don't edit in place. A dead window costs nothing: fresh window → board → resume from the pointer.
+One sanctioned drop location (e.g. `_inbox/`), names minted (`python lib/mint.py drop <label>`). Consuming a drop MEANS filing it into the owning folder, recording the move, deleting the drop.
 
-## 7. What this is not
+## 8. Canon hygiene
 
-Not a replacement for branch protection on the remote, not a permission layer, not a security control. It is the layer that keeps parallel agents from overwriting each other's in-flight work in one working tree, and it makes "never on main" something git enforces instead of something an agent remembers.
+Cite rulings by file + number, never paraphrase. Nothing retired goes bannerless. Knowledge is canon-with-a-home or code-with-a-pointer, never pointer-only.
+
+## 9. Signoff is agent-initiated
+
+The agent, not the owner, decides that a shift is over. It sets `status: closing` (`python scripts/lock.py close <folder>`) and runs the signoff when ANY of:
+
+- a) the lock's `task:` is complete;
+- b) the owner signals done — "that's it", "thanks", "next task", "new task", or equivalent;
+- c) it is about to write a cross-folder handoff and no work remains in this folder.
+
+Mid-task turns keep `status: open`; the Stop hook lets them end. Task shifted → `lock.py reopen --task "<new line>"`, stay open. Signoff is never something the owner requests; the phrases are signal b), not a command the ritual waits for. Headless agents run the same signoff before they exit; the runner's lock clear is only the crash fallback.
+
+**Order, enforced by `lock.py release`:** `close` → write `workflow-state/current-pointer.md` → commit your own paths → `release`, which refuses while: the pointer is older than the lock start · anything under the folder is uncommitted (`--allow-dirty "<why>"` records the exception) · a handoff this session wrote is gone or unregistered · a tracked handoff is uncommitted. Then the lock goes away and the Stop hook lets the turn end.
+
+## 10. Rationale — why every rule has an executable guard
+
+Two failure classes: (a) rules skipped when a task felt small — signoff forgotten, lock never taken before a "quick" edit; (b) guards that passed silently when they had nothing to check — no `.goal/`, no identity, hook not wired. Text in a context window cannot fix (a); fail-open code cannot fix (b).
+
+**The rule: a guard that cannot evaluate fails CLOSED, never open.** Unreadable registry, missing identity, unguarded folder, broken wiring, internal exception — each refuses and says what is missing. Loud and wrong beats quiet and permissive.
+
+**The ladder — each rung catches what the one above cannot:**
+
+| Guard | Where | Catches | Cannot catch |
+|---|---|---|---|
+| Edit-time guard `require_lock.py` (PreToolUse on Edit/Write/MultiEdit/NotebookEdit) | Claude Code, before the tool runs | editing without a lock, under someone else's lock, in unguarded folders — **where it happens, before files tangle** | writes via Bash/PowerShell, other runners, humans |
+| Commit guard `check_locks.py` (pre-commit) | git — any agent, any model, any human | staged paths under another window's lock, unclaimed/unguarded folders, `git add -A` sweeps — **the model-agnostic last line** | anything that never reaches `git commit`: uncommitted damage, destructive git ops |
+| Branch guard `protect_main.py` (pre-commit) | git | plain commits on `main`/`master` | force-pushes from elsewhere; needs remote branch protection too |
+| Permission layer (`.claude/settings.json` `permissions.ask`) | Claude Code, before Bash/PowerShell runs | destructive git ops that bypass pre-commit: `reset --hard`, `checkout .`, `restore .`, `stash`, `clean`, `push --force`, `rm -rf` — asks per subcommand, also inside `&&`/`;`, also in auto mode | `git restore <single path>` (indistinguishable from `--staged` by pattern), `bypassPermissions` mode, non-Claude runners |
+| Stop hook `require_signoff.py` | Claude Code, end of turn | ending a turn holding a `closing` lock with the pointer stale or the lock not released; ending with no identity (one nag per prompt) | an agent that never sets `closing` — that is the honest mid-task state and the board shows it |
+
+Hook decisions never bypass permission rules, and a blocking hook takes precedence over allow rules (Claude Code docs) — the ladder composes.
+
+**Environment matrix — which guardrail is active where:**
+
+| | Interactive Claude Code | Headless agent (`claude --print`, cwd = repo, `ICM_WINDOW` set by runner) | Plain terminal / other runner |
+|---|---|---|---|
+| Identity | session binding | env | env or refused |
+| Edit-time guard | active | active (project hooks load from cwd) | — |
+| Commit + branch guard | active | active | active (git) |
+| Permission `ask` | active (also auto mode); off in bypassPermissions | an ask denies (no human) | — |
+| Stop hook | active | active | — |
+| Proof | `bash tests/conflict_run.sh` (12 scenarios) + `check_locks.py --self-test` | scenarios 4–5 + the same hooks | scenarios 2–3, 9–12 |
+
+Every guard decision is appended to `<repo>/.goal/guard_log.jsonl`.

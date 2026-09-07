@@ -1,135 +1,217 @@
-"""Lock-aware commit guard (PROTOCOL.md section 1 + 5).
+"""Commit guard — pre-commit, model-agnostic (PROTOCOL.md §5 + §10). Fails CLOSED.
 
-Blocks a commit when any STAGED path lies inside a workfolder whose
-`.goal/LOCK.yaml` is FRESH (< 24 h) and held by a different session.
-This is the teeth behind "never `git add -A` across streams": a parallel
-session's commit sweep must not pick up another session's in-flight edits.
+Refuses the commit when:
+  a staged path lies under another window's fresh LOCK.yaml / .firing.lock   (the original rule)
+  a staged path is in a guarded folder with no fresh lock of yours              "claim first"
+  a staged path is in an unguarded folder (no .goal/)                          "claim it (creates .goal/)"
+  identity unknown / identity conflict / registry unreadable
+  the hook is not actually wired (git's hook dir is not this directory)        the silently-disabled case
+  any internal error
 
-Identity: the committing session passes its window name via ICM_WINDOW
-(`ICM_WINDOW=<window> git commit ...`). A lock whose `window:` matches
-(case-insensitive) is yours - allowed.
+Identity: ICM_WINDOW env, or the session binding via CLAUDE_CODE_SESSION_ID (Claude Code sets it
+in the Bash tool env) -> <repo>/.goal/sessions/<sid>.yaml. Override: ICM_LOCK_BYPASS=1 (say so).
 
-Resolution: nearest `.goal/LOCK.yaml` walking UP from each staged path.
-Top-level files (no directory) fall under the repo-root `.goal/LOCK.yaml`
-if one exists. Paths with no lock anywhere up the chain are unguarded.
-
-Escape hatches: ICM_LOCK_BYPASS=1 skips the guard (owner-approved only -
-say so in the commit message). Internal errors fail OPEN with a warning;
-a malformed lock fails CLOSED for the paths it guards (unknown holder =
-foreign).
-
-Exit 0 = allow, 1 = block.
+  python .githooks/check_locks.py --verify-wiring
+  python .githooks/check_locks.py --self-test [--if-changed]     records <repo>/.goal/selftest_last.json
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
-import re
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
-FRESH_HOURS = 24
-LOCK_REL = Path(".goal") / "LOCK.yaml"
+HERE = Path(__file__).resolve().parent
+LIB = next((c for c in (HERE / "lib", HERE.parent / "lib") if (c / "lockpath.py").is_file()), HERE / "lib")
+sys.path.insert(0, str(LIB))
+import lockpath as lp  # noqa: E402
+
+
+def _git(*args: str, cwd=None) -> str:
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.strip()
 
 
 def staged_paths(repo: Path) -> list:
-    out = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "-z"],
-        cwd=repo, capture_output=True, text=True, encoding="utf-8", errors="replace",
-    ).stdout
+    out = subprocess.run(["git", "diff", "--cached", "--name-only", "-z"], cwd=repo, capture_output=True, text=True,
+                         encoding="utf-8", errors="replace").stdout
     return [p for p in out.split("\0") if p]
 
 
-def read_lock(lock: Path) -> dict:
-    info: dict = {}
+def verify_wiring(repo: Path) -> str:
+    hooks_dir = _git("rev-parse", "--git-path", "hooks", cwd=repo)
+    if not hooks_dir:
+        return "not a git repo?"
+    hd = Path(hooks_dir)
+    if not hd.is_absolute():
+        hd = repo / hd
     try:
-        text = lock.read_text(encoding="utf-8", errors="replace")
-        m = re.search(r'^window:\s*"?([^"#\n]+?)"?\s*(#.*)?$', text, re.MULTILINE)
-        if m:
-            info["window"] = m.group(1).strip()
-        m = re.search(r'^started:\s*"?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})', text, re.MULTILINE)
-        if m:
-            info["started"] = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M")
+        hd = hd.resolve()
     except OSError:
         pass
-    return info
+    if hd != HERE.resolve():
+        return f"git's hook dir is {hd} but this guard lives in {HERE} — the pre-commit hook is NOT running. Fix: git config core.hooksPath \"{HERE}\""
+    if not (hd / "pre-commit").is_file():
+        return f"{hd}/pre-commit is missing"
+    return ""
 
 
-def is_fresh(lock: Path, info: dict) -> bool:
-    now = datetime.now()
-    started = info.get("started")
-    if started is not None:
-        return now - started < timedelta(hours=FRESH_HOURS)
-    try:
-        return now - datetime.fromtimestamp(lock.stat().st_mtime) < timedelta(hours=FRESH_HOURS)
-    except OSError:
-        return False
+def fingerprint(repo: Path) -> str:
+    h = hashlib.sha256()
+    for p in (HERE / "check_locks.py", HERE / "pre-commit", LIB / "lockpath.py", lp.REGISTRY):
+        try:
+            h.update(p.read_bytes())
+        except OSError:
+            h.update(b"MISSING:" + str(p).encode())
+    h.update(_git("config", "--get", "core.hooksPath", cwd=repo).encode())
+    return h.hexdigest()[:16]
 
 
-def guarding_lock(repo: Path, rel_path: str, cache: dict):
-    parts = Path(rel_path).parts
-    if len(parts) == 1:
-        root_lock = repo / LOCK_REL
-        return root_lock if root_lock.is_file() else None
-    for i in range(len(parts) - 1, 0, -1):
-        folder = Path(*parts[:i])
-        if folder not in cache:
-            lock = repo / folder / LOCK_REL
-            cache[folder] = lock if lock.is_file() else None
-        if cache[folder]:
-            return cache[folder]
-    return None
-
-
-def main() -> int:
+def guard(repo: Path) -> int:
     if os.environ.get("ICM_LOCK_BYPASS") == "1":
-        print("[folder-lock] ICM_LOCK_BYPASS=1 - lock guard skipped (owner-approved only).")
+        print("[lock-guard] ICM_LOCK_BYPASS=1 - guard skipped (owner-approved only; say so in the message).")
+        lp.guard_log({"guard": "check_locks", "decision": "bypass"})
         return 0
-    repo = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
-                               text=True, encoding="utf-8", errors="replace").stdout.strip())
-    me = os.environ.get("ICM_WINDOW", "").strip().lower()
-
+    wiring = verify_wiring(repo)
+    if wiring:
+        print(f"[lock-guard] REFUSED — hook wiring broken: {wiring}")
+        return 1
+    try:
+        me = lp.identity()
+    except lp.IdentityConflict as e:
+        print(f"[lock-guard] REFUSED — {e}")
+        return 1
+    if me is None:
+        print(f"[lock-guard] REFUSED — {lp.NO_IDENTITY_HELP}")
+        lp.guard_log({"guard": "check_locks", "decision": "refuse", "reason": "no identity"})
+        return 1
+    try:
+        flows = lp.load_registry()
+    except lp.RegistryUnreadable as e:
+        print(f"[lock-guard] REFUSED — registry unreadable: {e}")
+        return 1
+    problems: dict = {}
     cache: dict = {}
-    lock_info: dict = {}
-    violations: dict = {}
     for rel in staged_paths(repo):
-        lock = guarding_lock(repo, rel, cache)
-        if lock is None:
+        res = lp.resolve(rel, flows)
+        if res.kind == "unguarded":
+            problems.setdefault(f"UNGUARDED {res.folder}", []).append(rel)
             continue
-        if lock not in lock_info:
-            lock_info[lock] = read_lock(lock)
-        info = lock_info[lock]
-        if not is_fresh(lock, info):
+        if lp.is_whitelisted(rel, res, me):
             continue
-        holder = info.get("window", "<unparseable lock>")
-        if me and holder.strip().lower() == me:
-            continue
-        violations.setdefault(lock, []).append(rel)
-
-    if not violations:
+        key = str(res.lock_dir)
+        if key not in cache:
+            cache[key] = lp.locks_at(res.lock_dir)
+        locks = cache[key]
+        mine = [li for li in locks if lp.same_window(li.window, me.window) and li.fresh]
+        foreign = [li for li in locks if not lp.same_window(li.window, me.window) and (li.fresh or li.malformed)]
+        if foreign:
+            problems.setdefault(f"FOREIGN {res.folder or '<root>'}: {foreign[0].describe()}", []).append(rel)
+        elif not mine:
+            problems.setdefault(f"UNCLAIMED {res.folder or '<root>'}: no fresh lock of yours ({me.window}) — claim first", []).append(rel)
+    if not problems:
+        lp.guard_log({"guard": "check_locks", "decision": "allow", "window": me.window})
         return 0
-
-    print("[folder-lock] COMMIT BLOCKED - staged paths lie under another session's fresh folder lock:\n")
-    for lock, paths in violations.items():
-        info = lock_info[lock]
-        print(f"  {lock.relative_to(repo).as_posix()}")
-        print(f"    holder window: {info.get('window', '?')}   started: {info.get('started', '?')}")
+    print(f"[lock-guard] COMMIT BLOCKED (identity {me.window} via {me.source}):\n")
+    for head, paths in problems.items():
+        print(f"  {head}")
         for p in paths[:20]:
             print(f"    - {p}")
-        if len(paths) > 20:
-            print(f"    ... and {len(paths) - 20} more")
     print("\nRemedies:")
-    print("  * Not your paths -> unstage them: git restore --staged <path>...")
-    print("    (never sweep another stream's in-flight work into your commit)")
-    print("  * It IS your lock -> commit as yourself: ICM_WINDOW=<your window> git commit ...")
-    print("  * Owner-approved override -> ICM_LOCK_BYPASS=1 git commit ... (say so in the message)")
+    print("  * FOREIGN   -> not your paths: git restore --staged <path>  (never sweep another stream's work)")
+    print("  * UNCLAIMED -> python scripts/lock.py claim <folder> --task \"...\"  then commit")
+    print("  * UNGUARDED -> the same claim creates the .goal/")
+    print("  * owner-approved override only: ICM_LOCK_BYPASS=1 git commit ... (say so in the message)")
+    lp.guard_log({"guard": "check_locks", "decision": "refuse", "window": me.window, "problems": {k: v[:5] for k, v in problems.items()}})
     return 1
+
+
+def self_test(repo: Path, if_changed: bool) -> int:
+    import shutil
+    import tempfile
+    rec = lp.STATE / "selftest_last.json"
+    fp = fingerprint(repo)
+    if if_changed and rec.is_file():
+        try:
+            last = json.loads(rec.read_text(encoding="utf-8"))
+            if last.get("fingerprint") == fp and last.get("result") == "PASS":
+                print(f"[lock-guard] self-test: unchanged since {last.get('ts')} (fingerprint {fp}) — skipping")
+                return 0
+        except (OSError, json.JSONDecodeError):
+            pass
+    results = []
+
+    def case(name, ok, detail=""):
+        results.append((name, ok))
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"\n        {detail[:300]}" if detail and not ok else ""))
+
+    wiring = verify_wiring(repo)
+    case("hook wiring: git's hook dir is this directory", not wiring, wiring)
+    tmp = Path(tempfile.mkdtemp(prefix="folderlock-selftest-"))
+    try:
+        fx = tmp / "repo"
+        (fx / ".githooks" / "lib").mkdir(parents=True)
+        (fx / ".folder-lock").mkdir()
+        for f in HERE.iterdir():
+            if f.is_file():
+                shutil.copy2(f, fx / ".githooks" / f.name)
+        for f in LIB.glob("*.py"):
+            shutil.copy2(f, fx / ".githooks" / "lib" / f.name)
+        (fx / ".folder-lock" / "registry.yaml").write_text("workflows:\n- id: fixture-flow\n  owns:\n  - fixture/**\n", encoding="utf-8")
+        env = {k: v for k, v in os.environ.items() if k not in ("ICM_WINDOW", "ICM_LOCK_BYPASS", "CLAUDE_CODE_SESSION_ID", "MAIN_COMMIT_OK")}
+        env["FOLDER_LOCK_ROOT"] = str(fx)
+
+        def run(*args, **kw):
+            e = dict(env); e.update(kw.pop("env", {}))
+            return subprocess.run(list(args), cwd=fx, env=e, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+        run("git", "init", "-q", "-b", "main"); run("git", "config", "user.email", "t@x.invalid"); run("git", "config", "user.name", "t")
+        run("git", "config", "commit.gpgsign", "false"); run("git", "config", "core.hooksPath", str(fx / ".githooks"))
+        run("git", "checkout", "-q", "-b", "feat/x")
+        (fx / "fixture" / ".goal").mkdir(parents=True)
+        (fx / "fixture" / ".goal" / "LOCK.yaml").write_text(
+            f'holder: interactive\nwindow: "window-a"\nstatus: open\ntask: "fixture"\nstarted: "{datetime.now().strftime(lp.TS_FMT)}"\n', encoding="utf-8")
+        (fx / "fixture" / "f.txt").write_text("1\n"); run("git", "add", "fixture/f.txt")
+        r = run("git", "commit", "-q", "-m", "as window-b", env={"ICM_WINDOW": "window-b"}); o = r.stdout + r.stderr
+        case("staged path under a synthetic FOREIGN lock is refused", r.returncode != 0 and "FOREIGN" in o, o)
+        r = run("git", "commit", "-q", "-m", "no identity"); o = r.stdout + r.stderr
+        case("no identity is refused", r.returncode != 0 and "no window identity" in o, o)
+        r = run("git", "commit", "-q", "-m", "as holder", env={"ICM_WINDOW": "Window-A"}); o = r.stdout + r.stderr
+        case("holder (case-insensitive) passes", r.returncode == 0, o)
+        (fx / "loose").mkdir(); (fx / "loose" / "x.txt").write_text("x\n"); run("git", "add", "loose/x.txt")
+        r = run("git", "commit", "-q", "-m", "unguarded", env={"ICM_WINDOW": "window-a"}); o = r.stdout + r.stderr
+        case("unguarded folder (no .goal/) is refused", r.returncode != 0 and "UNGUARDED" in o, o)
+        run("git", "config", "core.hooksPath", str(tmp / "elsewhere"))
+        r = run(sys.executable, str(fx / ".githooks" / "check_locks.py"), "--verify-wiring"); o = r.stdout + r.stderr
+        case("broken hooksPath is detected loudly by --verify-wiring", r.returncode != 0 and "NOT running" in o, o)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    ok = all(r[1] for r in results)
+    rec.parent.mkdir(parents=True, exist_ok=True)
+    rec.write_text(json.dumps({"ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), "fingerprint": fp,
+                               "result": "PASS" if ok else "FAIL", "cases": [{"name": n, "ok": o} for n, o in results]}, indent=1), encoding="utf-8")
+    print(f"[lock-guard] self-test {'PASS' if ok else 'FAIL'}: {sum(1 for r in results if r[1])}/{len(results)} (fingerprint {fp})")
+    return 0 if ok else 1
+
+
+def main(argv: list) -> int:
+    repo = Path(_git("rev-parse", "--show-toplevel") or lp.ROOT)
+    if "--verify-wiring" in argv:
+        w = verify_wiring(repo)
+        print("[lock-guard] wiring OK: git will run this pre-commit" if not w else f"[lock-guard] WIRING BROKEN — hook NOT running: {w}")
+        return 0 if not w else 1
+    if "--self-test" in argv:
+        return self_test(repo, "--if-changed" in argv)
+    return guard(repo)
 
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
-    except Exception as e:  # infrastructure failure: fail OPEN, never brick commits
-        print(f"[folder-lock] WARNING: lock guard errored ({e!r}) - allowing commit.")
-        sys.exit(0)
+        sys.exit(main(sys.argv[1:]))
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[lock-guard] REFUSED — guard error {e!r}. A guard that cannot evaluate fails closed; fix it, or ICM_LOCK_BYPASS=1 with the owner's approval.")
+        sys.exit(1)

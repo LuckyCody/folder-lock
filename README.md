@@ -1,79 +1,80 @@
 # folder-lock — many agents, one repo, no conflicting saves
 
-A Claude Code skill (works with any agent runner that reads `SKILL.md`, and the hooks work with **no** agent at all) for running several AI agents in parallel on one working tree without them overwriting each other or dirtying `main`.
+A Claude Code skill (works with any agent runner that reads `SKILL.md`; the git hooks work with **no** agent at all) for running several AI agents in parallel on one working tree without them overwriting each other, dirtying `main`, or "forgetting" the protocol when a task feels small.
 
-Distilled from a live human+agent monorepo where 3–6 sessions run at once across ~40 workfolders, after two real incidents: a parallel session's commit sweep picked up another session's lock-protected in-flight edits, and an agent wrote straight to `main` because a small task "didn't feel like it counted".
+Distilled from a live human+agent monorepo where 3–6 sessions run at once across ~40 workfolders, after three real incidents: a parallel session's commit sweep picked up another session's lock-protected in-flight edits; an agent wrote straight to `main` because a small task "didn't feel like it counted"; and a guard that passed silently because there was nothing for it to check.
 
-## The idea in three sentences
+## The idea in four sentences
 
-The unit of coordination is the **folder** — not the task, not the project, not the agent — because folders are where files collide. Each session takes **one lock per folder** as its first act, edits only inside it, writes a **handoff** into any other folder it needs touched, and leaves a **typed resume pointer** behind as its last act. A **git pre-commit guard** makes two of those rules unskippable: no commit into another session's fresh lock, no plain commit on `main` — and it is only considered installed once a self-test has tried to break it.
+The unit of coordination is the **folder** — not the task, not the project, not the agent — because folders are where files collide. Each session **claims one lock per folder** as its first act (a minted window ID bound to the Claude session), edits only inside it, writes a **handoff** into any other folder it needs touched, and **signs itself off** — `closing` → pointer → commit → release — without waiting to be asked. Three **fail-closed guards** make that unskippable: a PreToolUse hook that denies edits outside your lock, a model-agnostic pre-commit that refuses foreign, unclaimed, unguarded or identity-less commits (and plain commits on `main`), and a Stop hook that will not let a turn end while a lock is `closing`. None of it counts as installed until a self-test has tried to break it.
 
-## Why a git hook and not an agent rule
+## Why hooks and not rules
 
-A rule that lives only as text in the context window gets skipped the second a task feels low-stakes. Agent-side hooks (Claude hooks, MCP guards) are better, but they are tied to one runner. `git` refusing is model-agnostic, runner-agnostic, and works when a human forgets too.
+A rule that lives only as text in the context window gets skipped the second a task feels low-stakes. A guard that passes when it has nothing to check is not a guard. So: every rule that can be checked by a program is; every guard that cannot evaluate refuses and says what is missing; and the git-level guards work for any agent, any model, and any human who forgets.
 
 ## Install
 
 ```bash
-# as a skill (project-level)
-git clone https://github.com/LuckyCody/folder-lock .claude/skills/folder-lock
-
-# or user-level (all projects)
-git clone https://github.com/LuckyCody/folder-lock ~/.claude/skills/folder-lock
-
-# then install + PROVE the hooks in a repo (re-run in every clone and worktree)
-python .claude/skills/folder-lock/scripts/install.py
+git clone https://github.com/LuckyCody/folder-lock .claude/skills/folder-lock   # or ~/.claude/skills/folder-lock
+python .claude/skills/folder-lock/scripts/install.py --claude-hooks              # re-run in every clone and worktree
 ```
 
-Expected tail of the install output:
+Expected tail:
 
 ```
-  PASS  hooksPath points at the hooks under test and pre-commit is executable
-  PASS  direct commit to main is BLOCKED
-  PASS  commit to main with MAIN_COMMIT_OK=1 PASSES
-  PASS  commit on feat/x PASSES
-  PASS  commit into another window's FRESH lock is BLOCKED
-  PASS  same commit as the lock holder (ICM_WINDOW, case-insensitive) PASSES
-  PASS  commit to an unlocked path while a lock exists elsewhere PASSES
-  PASS  commit under a STALE (25h) lock PASSES (guard enforces fresh locks only)
+  PASS  hook wiring: git's hook dir is this directory
+  PASS  staged path under a synthetic FOREIGN lock is refused
+  PASS  no identity is refused
+  PASS  holder (case-insensitive) passes
+  PASS  unguarded folder (no .goal/) is refused
+  PASS  broken hooksPath is detected loudly by --verify-wiring
+[lock-guard] self-test PASS: 6/6
 
-ALL GOOD: 8/8 cases behaved.
+INSTALLED and PROVEN. Repeat in every clone/worktree.
 ```
 
-If you only want the hooks, copy `hooks/` anywhere and `git config core.hooksPath <that dir>`. Then run `python scripts/selftest.py <that dir>`.
+Then prove the whole ladder: `bash .claude/skills/folder-lock/tests/conflict_run.sh` — 12 scenarios, each ending in a visible refusal (or a visible pass where a pass is the point), with hook stdin/stdout printed for the edit, Stop and no-identity cases.
 
 ## Daily shape
 
 ```bash
-python scripts/board.py                                   # what's in flight, what's waiting
-python scripts/lock.py take finance/payroll --window payroll-close --task "August close"
-# ... work only inside finance/payroll ...
-python scripts/handoff.py --to finance/datev --task "re-export EXTF for 60900 after close"
-ICM_WINDOW=payroll-close git commit -m "..."              # guard lets your own lock through
-python scripts/lock.py release finance/payroll --window payroll-close
+python scripts/board.py                                    # what's in flight (locks show status: closing = signing off)
+python scripts/lock.py claim finance/payroll --task "August close" --hint payroll
+# ... edit only inside finance/payroll — the edit guard denies anything else ...
+python scripts/handoff.py --to finance/datev --task "re-export EXTF after close"
+git add <your paths> && git commit -m "..."                # identity comes from the session binding
+python scripts/lock.py close finance/payroll               # task done -> closing; Stop hook now insists on the rest
+#     write finance/payroll/workflow-state/current-pointer.md, commit
+python scripts/lock.py release finance/payroll             # verifies pointer, tree, handoffs; deletes the lock
 ```
 
-The full contract is one page: [PROTOCOL.md](PROTOCOL.md). What an agent does at each moment: [SKILL.md](SKILL.md).
+Inside Claude Code no env var is needed: `claim` binds the minted window to `CLAUDE_CODE_SESSION_ID`, which the Bash tool exposes and hooks receive as `session_id`. Plain terminals and headless agents set `ICM_WINDOW=<window>`.
 
-## The pointer grammar (why "small" resumes work)
+## What each guard catches (PROTOCOL §10 has the full table and the environment matrix)
 
-Every folder's `workflow-state/current-pointer.md` has a typed `Next concrete action:` line — plain (actionable), `WHEN <cond> →` (tripwire, never counts as procrastination), `PARKED (…)` (owner-suspended, runners never touch it), `NONE — …` (closed). The board classifies folders by it, so a fresh window — any model, any runner — reads one screen and resumes cold.
-
-## Escape hatches (deliberate, loud, in the commit message)
-
-| Var | Effect |
+| Guard | Catches |
 |---|---|
-| `ICM_WINDOW=<name>` | you are the lock holder — your own locked paths pass |
-| `MAIN_COMMIT_OK=1` | deliberate solo-lane commit on `main` |
-| `ICM_LOCK_BYPASS=1` | skip the lock guard entirely — owner-approved only |
-| `git config folderlock.protected "main,release"` | change the protected-branch list |
+| `require_lock.py` (PreToolUse) | editing without a lock, under someone else's lock, in a folder with no `.goal/` — before files tangle |
+| `check_locks.py` (pre-commit) | staged paths under another window's lock, unclaimed/unguarded folders, `git add -A` sweeps, missing identity, a hook that is not actually wired |
+| `protect_main.py` (pre-commit) | plain commits on `main`/`master` |
+| `require_signoff.py` (Stop) | ending a turn holding a `closing` lock with the pointer stale or the lock not released; ending with no identity |
 
-Both guards **fail open** on infrastructure errors (missing python, git plumbing failure) with a warning: a guard must never brick commits, it must be loud instead. A malformed lock fails **closed** for the paths it guards.
+Escape hatches, all deliberate and loud: `ICM_WINDOW=<w>` (you are the holder), `MAIN_COMMIT_OK=1` (solo commit on main), `ICM_LOCK_BYPASS=1` (owner-approved only), `git config folderlock.protected "main,release"`.
+
+## Optional registry
+
+Drop `.folder-lock/registry.yaml` in the repo to resolve paths to workflow homes instead of nearest-`.goal/`:
+
+```yaml
+workflows:
+- id: payroll
+  owns:
+  - finance/payroll/**
+  - .claude/skills/payroll/**        # locks at finance/payroll/.goal — one lock per workflow home
+```
 
 ## Companion skills
 
-- [signoff](https://github.com/LuckyCody/signoff) — the end-of-session ritual that writes the pointer and releases the lock.
-- [workflow-builder](https://github.com/LuckyCody/workflow-builder) — the `workflow-state/` tree the pointer lives in.
-- [audit-skill](https://github.com/LuckyCody/audit-skill) — read-only evidence → rulings → ledger-verified execution; an audit is a locked session like any other.
+- [signoff](https://github.com/LuckyCody/signoff) · [workflow-builder](https://github.com/LuckyCody/workflow-builder) · [audit-skill](https://github.com/LuckyCody/audit-skill)
 
 MIT — Lucky Office GmbH.
