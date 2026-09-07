@@ -1,0 +1,20 @@
+# <repo>/.folder-lock/deploy-units.yaml — deploy units (PROTOCOL.md §11)
+#
+# A deploy unit is one independently deployable artefact. It is NOT a lock domain: the module folders
+# inside it (see templates/registry.yaml) each carry their own lock; this file only says "when any of
+# these paths change, that artefact needs a deploy". Sessions never run `deploy:` themselves — they drop
+# a request (scripts/deploy_request.py --for <folder>) and the single deployer (scripts/deployer.py)
+# deploys HEAD once for every pending request.
+units:
+  web-app:
+    description: "the customer-facing web app (one container, several modules)"
+    paths:
+      - apps/web/**
+      - libs/shared/**
+    deploy: python apps/web/deploy.py          # from the repo root; exit 0 = deployed
+    busy_exit_codes: [2]                       # "another deploy of this artefact is in flight" -> retry next pass
+    tests: python -m pytest apps/web -q        # scripts/test_unit.py web-app runs this and leaves the guard's marker
+    dirty_ignore:                              # tracked files that may be dirty without blocking a deploy
+      - "**/*.log"
+    branch: main
+    timeout_s: 3600

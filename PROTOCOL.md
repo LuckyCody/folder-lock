@@ -34,6 +34,8 @@ started: "YYYY-MM-DDTHH:MM"   # minted
 
 **Session last act** is the agent-initiated signoff (§9): `close` → pointer → commit → `release`. Locks are runtime state: gitignored (`**/.goal/`), never committed. One session may hold a second folder's lock only when the owner's task explicitly spans both — `claim` then reuses the session's window so every commit stays attributable; drift into a third folder is still a handoff (§2).
 
+**Lock granularity = the files being edited, never "the deploy unit".** One deployable app that hosts unrelated modules is NOT one lock — three sessions queuing on one lock while editing files that never touch each other is a structural collision, not a real one. Give each module folder (`<app>/<module>/**`) its own registry workflow and `.goal/`, and put the wiring — router registration, the job-runner and its job-type registry, base templates/static, the deploy script, shared auth — in `<app>/core/**` with its own lock, expected to be held rarely and briefly. The resolver works per FILE (longest matching glob), so a session touching only `<app>/billing/` acquires only that lock, touching `core/` acquires core, and a commit spanning two modules needs both — that is the point. Modules register into core (routers, job types); core never imports module internals. Serializing the deploy is §11's job, not the lock's. Example: `templates/registry.yaml`.
+
 ## 1b. Identity — minted, bound, never hand-formatted
 
 `lib/mint.py` is the ONLY place an identifier is formatted: window IDs (`<hint>-<yymmdd>-<4>`), lock timestamps, handoff names, drop names, agent IDs. Agents call it or go through the writers that call it (`scripts/lock.py`, `scripts/handoff.py`). An agent that types an ID by hand is a defect.
@@ -138,3 +140,21 @@ Hook decisions never bypass permission rules, and a blocking hook takes preceden
 | Proof | `bash tests/conflict_run.sh` (12 scenarios) + `check_locks.py --self-test` | scenarios 4–5 + the same hooks | scenarios 2–3, 9–12 |
 
 Every guard decision is appended to `<repo>/.goal/guard_log.jsonl`.
+
+## 11. Deploy queue — HEAD is always deployable
+
+A single lock on a deployable app conflates two concerns: **edit conflicts** (real — need a lock at the granularity of the files touched, §1) and **deploy races** (a serialization problem — deploy is idempotent, "deploy HEAD" twice = once). Keep them apart.
+
+**Deploy units** are declared in `.folder-lock/deploy-units.yaml` (paths → deploy command → tests → dirty-ignore; example: `templates/deploy-units.yaml`). A unit is NOT a lock domain; several lock domains (modules) sit inside one unit. **Sessions never run a unit's deploy script directly.**
+
+**Request, don't deploy.** A finished session commits its own paths and drops a request — `python scripts/deploy_request.py --for <workfolder>` → `.goal/deploy/requests/<unit>/<minted>.yaml {workflow, commit, requested_at, window}`. The signoff does this as its last commit-side step; a folder outside every unit gets "no deploy unit covers" and exit 0.
+
+**One deployer.** `python scripts/deployer.py`, run every few minutes by any scheduler (cron, schtasks, a CI timer), holds one lock (`.goal/deploy/deployer.lock`: minted agent id + PID + 60-s heartbeat, stale 15 min — the runner `.firing.lock` pattern), takes ALL pending requests of a unit, deploys HEAD **once**, writes `{event: deployed, deployed_commit, deployed_at, build{run, log, duration_s, collapsed, requests}}` into every requesting folder's `workflow-state/deploys.jsonl` (+ `last-deploy.yaml`), and moves the requests to `.goal/deploy/done/`. Concurrent requests collapse into one deploy; a request whose commit HEAD already carries completes as `already-deployed` without a build. **Failure** → requests stay pending with `attempts+1`, a `failed` line per workflow-state, `.goal/deploy/state/failed/<unit>.yaml` — `scripts/board.py` renders it until the next success; back-off 30 min × attempts (cap 6 h), a newer request retries at once, `--retry-now` overrides. `python scripts/deployer.py status` shows the queue.
+
+**The invariant this introduces: HEAD must always be deployable** — anyone's finish deploys everyone's committed work.
+- **Commit only complete, tested states to `main`.** Work that must land in pieces goes behind a feature flag, or on a short-lived branch merged as a unit (§4 feature lane). A half-finished edit on `main` is somebody else's outage.
+- **Tests before the commit:** `python scripts/test_unit.py <unit>` runs the unit's tests and leaves a per-window marker. The commit guard **WARNS — never refuses** (best effort) when a commit touches a unit without a fresh PASS marker from this session.
+- **The deployer deploys the working tree at HEAD and BLOCKS** (`.goal/deploy/state/blocked/<unit>.yaml`, requests wait, board shows it) while a tracked source file under the unit is dirty, HEAD is off the unit's branch, or no pending request's commit is in HEAD. An uncommitted edit is not deployable state, and nobody else's request may ship it. Logs and scheduler state listed in `dirty_ignore` are exempt.
+- **Rollback is a revert commit plus a new request** — never a hand-run deploy.
+
+Proof: `python scripts/deploy_selftest.py` — collapse, already-deployed, failure + back-off, dirty-tree block, guard warning, in a throwaway repo.

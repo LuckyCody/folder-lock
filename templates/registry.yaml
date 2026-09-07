@@ -1,0 +1,25 @@
+# <repo>/.folder-lock/registry.yaml — per-path lock domains (PROTOCOL.md §1)
+#
+# One app, several modules that never touch each other's files, one shared wiring layer. Each module is
+# its own workflow with its own `.goal/` lock; `core` holds the wiring (app object, router registration,
+# job-runner registry, base templates, deploy script, shared auth) and is expected to be held rarely and
+# briefly. Resolution is per FILE, longest matching glob wins: a session editing only apps/web/billing/
+# acquires only the billing lock; a commit spanning two modules needs both locks — that is the point.
+# Modules register into core (routers, job types); core never imports module internals.
+# Deploy serialization is NOT the lock's job — see deploy-units.yaml.
+workflows:
+- id: web-core
+  owns:
+  - apps/web/core/**                 # app wiring, router registration, JOB_TYPES registry, base templates, deploy.py
+- id: web-billing
+  owns:
+  - apps/web/billing/**
+- id: web-inventory
+  owns:
+  - apps/web/inventory/**
+- id: web-reports
+  owns:
+  - apps/web/reports/**
+- id: shared-libs
+  owns:
+  - libs/shared/**

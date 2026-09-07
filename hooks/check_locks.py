@@ -7,6 +7,8 @@ Refuses the commit when:
   identity unknown / identity conflict / registry unreadable
   the hook is not actually wired (git's hook dir is not this directory)        the silently-disabled case
   any internal error
+WARNS (never refuses) when a staged path lies inside a deploy unit (.folder-lock/deploy-units.yaml) and this
+session has no fresh PASS marker from `scripts/test_unit.py <unit>` (PROTOCOL §11, best effort).
 
 Identity: ICM_WINDOW env, or the session binding via CLAUDE_CODE_SESSION_ID (Claude Code sets it
 in the Bash tool env) -> <repo>/.goal/sessions/<sid>.yaml. Override: ICM_LOCK_BYPASS=1 (say so).
@@ -69,6 +71,39 @@ def fingerprint(repo: Path) -> str:
     return h.hexdigest()[:16]
 
 
+def deploy_unit_warnings(staged: list, me) -> list:
+    """PROTOCOL.md §11 — best effort, WARN only, never refuses.
+
+    A commit that touches a deploy unit (.folder-lock/deploy-units.yaml `paths`) should have that unit's
+    tests run in THIS session: `python scripts/test_unit.py <unit>` leaves a per-window marker under
+    .goal/deploy/state/tests/. Missing / failed / stale (>24h) marker -> one warning per unit. No units
+    file, or any internal error -> no warnings (advisory; the lock rules above stay the gate)."""
+    if not staged or me is None:
+        return []
+    try:
+        import deployunits as U  # same lib dir as lockpath
+        units = U.load_units()
+        if not units:
+            return []
+        touched = U.units_for_paths(staged, units)
+    except Exception as e:  # noqa: BLE001 — advisory check must never break the guard
+        return [f"deploy-unit test check skipped ({e!r})"]
+    warns = []
+    for name, paths in sorted(touched.items()):
+        if not units[name].tests:
+            continue
+        m = U.read_test_marker(name, me.window)
+        cmd = f"python scripts/test_unit.py {name}"
+        if not m:
+            warns.append(f"deploy unit '{name}' touched ({len(paths)} file(s)) but its tests have not run in this "
+                         f"session (window {me.window}) — run: {cmd}")
+        elif m.get("result") != "PASS":
+            warns.append(f"deploy unit '{name}': the last test run in this session FAILED at {m.get('ran_at')} — fix it, then: {cmd}")
+        elif not m.get("fresh"):
+            warns.append(f"deploy unit '{name}': test marker is older than 24h ({m.get('ran_at')}) — re-run: {cmd}")
+    return warns
+
+
 def guard(repo: Path) -> int:
     if os.environ.get("ICM_LOCK_BYPASS") == "1":
         print("[lock-guard] ICM_LOCK_BYPASS=1 - guard skipped (owner-approved only; say so in the message).")
@@ -112,7 +147,12 @@ def guard(repo: Path) -> int:
         elif not mine:
             problems.setdefault(f"UNCLAIMED {res.folder or '<root>'}: no fresh lock of yours ({me.window}) — claim first", []).append(rel)
     if not problems:
-        lp.guard_log({"guard": "check_locks", "decision": "allow", "window": me.window})
+        warns = deploy_unit_warnings(staged_paths(repo), me)
+        for w in warns:
+            print(f"[lock-guard] WARN (PROTOCOL §11, not blocking): {w}")
+        if warns:
+            print("[lock-guard] HEAD must stay deployable — anyone's finish deploys everyone's committed work.")
+        lp.guard_log({"guard": "check_locks", "decision": "allow", "window": me.window, **({"warn": warns} if warns else {})})
         return 0
     print(f"[lock-guard] COMMIT BLOCKED (identity {me.window} via {me.source}):\n")
     for head, paths in problems.items():

@@ -1,5 +1,7 @@
 # folder-lock — many agents, one repo, no conflicting saves
 
+**v3.0.0** — adds per-module locks with a shared `core` lock, and a deploy queue (request → one deployer → HEAD) with the "HEAD is always deployable" invariant. See [What's new in v3](#whats-new-in-v3).
+
 A Claude Code skill (works with any agent runner that reads `SKILL.md`; the git hooks work with **no** agent at all) for running several AI agents in parallel on one working tree without them overwriting each other, dirtying `main`, or "forgetting" the protocol when a task feels small.
 
 Distilled from a live human+agent monorepo where 3–6 sessions run at once across ~40 workfolders, after three real incidents: a parallel session's commit sweep picked up another session's lock-protected in-flight edits; an agent wrote straight to `main` because a small task "didn't feel like it counted"; and a guard that passed silently because there was nothing for it to check.
@@ -33,7 +35,7 @@ Expected tail:
 INSTALLED and PROVEN. Repeat in every clone/worktree.
 ```
 
-Then prove the whole ladder: `bash .claude/skills/folder-lock/tests/conflict_run.sh` — 12 scenarios, each ending in a visible refusal (or a visible pass where a pass is the point), with hook stdin/stdout printed for the edit, Stop and no-identity cases.
+Then prove the whole ladder: `bash .claude/skills/folder-lock/tests/conflict_run.sh` — 12 scenarios (plus `python scripts/deploy_selftest.py` for the deploy queue), each ending in a visible refusal (or a visible pass where a pass is the point), with hook stdin/stdout printed for the edit, Stop and no-identity cases.
 
 ## Daily shape
 
@@ -45,6 +47,7 @@ python scripts/handoff.py --to finance/datev --task "re-export EXTF after close"
 git add <your paths> && git commit -m "..."                # identity comes from the session binding
 python scripts/lock.py close finance/payroll               # task done -> closing; Stop hook now insists on the rest
 #     write finance/payroll/workflow-state/current-pointer.md, commit
+python scripts/deploy_request.py --for finance/payroll     # v3: request the deploy — the single deployer ships HEAD (§11)
 python scripts/lock.py release finance/payroll             # verifies pointer, tree, handoffs; deletes the lock
 ```
 
@@ -72,6 +75,34 @@ workflows:
   - finance/payroll/**
   - .claude/skills/payroll/**        # locks at finance/payroll/.goal — one lock per workflow home
 ```
+
+## What's new in v3
+
+### Locks are per module, deploys are per unit
+
+The v2 failure mode: one deployable app hosting unrelated modules, one lock, three sessions queuing on it while editing files that never touched each other. The lock was protecting "the deploy unit" instead of "the files being edited" — a structural collision, not a real one.
+
+v3 separates the two concerns (PROTOCOL §1 + §11):
+
+- **Edit conflicts** get a lock at the granularity of the files touched. Each module folder is its own registry workflow with its own `.goal/`; the app's wiring (router registration, job-type registry, base templates, deploy script, shared auth) lives in a `core/` workflow that is held rarely and briefly. Resolution is per file, longest glob wins — a session in `apps/web/billing/` takes only the billing lock; a commit spanning two modules needs both. Modules register into core; core never imports module internals. Example: [`templates/registry.yaml`](templates/registry.yaml).
+- **Deploy races** are a serialization problem, and deploy is idempotent. So: a deploy queue.
+
+### Deploy queue
+
+```bash
+# .folder-lock/deploy-units.yaml — which paths form one deployable artefact, how to deploy + test it
+python scripts/deploy_request.py --for apps/web/billing      # a finished session REQUESTS (signoff does this)
+python scripts/deployer.py                                    # ONE deployer, from any scheduler every few minutes:
+                                                              #   collapses all pending requests of a unit into one deploy of HEAD,
+                                                              #   writes the result into each requester's workflow-state/deploys.jsonl
+python scripts/deployer.py status                             # pending / FAILED / BLOCKED / last deploy per unit
+python scripts/test_unit.py web-app                           # run the unit's tests, leave the marker the commit guard looks for
+python scripts/deploy_selftest.py                             # prove it in a throwaway repo (collapse, failure, dirty-tree block, guard warning)
+```
+
+**The invariant this introduces: HEAD must always be deployable** — anyone's finish deploys everyone's committed work. Commit only complete, tested states to `main`; piecewise work goes behind a feature flag or on a short-lived branch merged as a unit. Three executable consequences: the commit guard *warns* when a commit touches a unit without a fresh test marker from this session; the deployer *blocks* (flag on the board, requests wait) while a tracked source file under the unit is dirty; a failed deploy stays visible on the board until the next success, with 30-min × attempts back-off that a newer request overrides. Rollback is a revert commit plus a new request — never a hand-run deploy. Example: [`templates/deploy-units.yaml`](templates/deploy-units.yaml).
+
+`scripts/board.py json` now returns `{"folders": [...], "deploys": [...]}` (v2 returned the folder list bare).
 
 ## Companion skills
 
