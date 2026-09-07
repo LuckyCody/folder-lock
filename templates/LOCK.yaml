@@ -1,0 +1,6 @@
+holder: interactive        # interactive | fired
+window: "payroll-close"    # your terminal/window name — doubles as commit identity (ICM_WINDOW)
+task: "one line: what this session is doing in this folder"
+stream: "workflow-or-stream-id"
+branch: "feat/payroll-close"   # or "main", or the worktree path
+started: "2026-09-07T14:05"
