@@ -43,8 +43,13 @@ def rmtree(p: Path) -> None:
 def main(argv: list[str]) -> int:
     for f in (ALPHA, BETA):
         rmtree(ROOT / f)
-        (ROOT / f / ".goal" / "inbox").mkdir(parents=True)
-        (ROOT / f / "workflow-state").mkdir(parents=True)
+        (ROOT / f / ".goal" / "inbox").mkdir(parents=True, exist_ok=True)
+        for stale in (ROOT / f / ".goal" / "inbox").glob("*.md"):
+            stale.unlink()
+        (ROOT / f / "workflow-state").mkdir(parents=True, exist_ok=True)
+        for stale in (ROOT / f / "workflow-state").glob("*.md"):
+            stale.unlink()
+        (ROOT / f / "autorun_done.txt").unlink(missing_ok=True)
         (ROOT / f / "CONTEXT.md").write_text(f"# {f} — autorun fixture\n", encoding="utf-8")
     (ROOT / ALPHA / "workflow-state" / "current-pointer.md").write_text("# Current pointer — alpha\n\nNext concrete action: write hello.txt (fixture: plain ready item).\n", encoding="utf-8")
     (ROOT / BETA / "workflow-state" / "current-pointer.md").write_text("# Current pointer — beta\n\nNext concrete action: DECIDE-OWNER which colour the fixture uses.\n", encoding="utf-8")
