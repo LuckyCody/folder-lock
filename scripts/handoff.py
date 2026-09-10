@@ -65,6 +65,7 @@ def main() -> int:
     ap.add_argument("--to", required=True); ap.add_argument("--task", required=True)
     ap.add_argument("--mode", choices=["stage", "fire"], default="stage")
     ap.add_argument("--from", dest="source", default=""); ap.add_argument("--body", default="")
+    ap.add_argument("--force", action="store_true", help="owner-only: bypass the §13 dedup")
     a = ap.parse_args()
     target_rel = a.to.replace("\\", "/").strip("/")
     target = ROOT / target_rel if target_rel not in ("", ".") else ROOT
@@ -81,6 +82,13 @@ def main() -> int:
         mode = "stage"
     body = sys.stdin.read() if a.body == "-" else (Path(a.body).read_text(encoding="utf-8") if a.body else "")
     now = mint.now()
+    # dedup (PROTOCOL §13): a handoff IS a board item — no second open item with the same owner + title
+    import items as _items
+    _dup = _items.find_dup(_items.load(), _items.owner_of(target_rel), a.task)
+    if _dup and not getattr(a, "force", False):
+        print(f"DUPLICATE: an open item with this title already exists for that owner: {_dup} -> nothing written "
+              f"(extend that item, or --force with the owner's say-so)", file=sys.stderr)
+        return 4
     inbox = target / ".goal" / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
     note = inbox / f"{mint.handoff(a.task, now)}.{'staged' if mode == 'stage' else 'fired'}.md"
@@ -91,6 +99,10 @@ def main() -> int:
         f"Consuming this handoff means doing the task (or filing it into this folder's workflow-state), "
         f"recording the outcome in this folder's progress/log, and deleting this file.\n", encoding="utf-8")
     _register_inbox(target_rel)
+    try:
+        _items.upsert(target_rel, "handoff", note.name, a.task, created_by=a.source or "dispatcher", status="ready", force=True)
+    except Exception as _e:
+        print(f"(item not recorded: {_e})", file=sys.stderr)
     sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
     if sid:
         try:

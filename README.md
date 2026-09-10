@@ -1,6 +1,6 @@
 # folder-lock — many agents, one repo, no conflicting saves
 
-**v3.0.0** — adds per-module locks with a shared `core` lock, and a deploy queue (request → one deployer → HEAD) with the "HEAD is always deployable" invariant. See [What's new in v3](#whats-new-in-v3).
+**v4.0.0** — the board becomes a work queue: every item has `ready | in_progress | waiting_owner | done`, a decision-ready `question` when it waits on the owner, `created_by`/`owner` routing by path, a dedup rule, a per-folder autorun log, and `scripts/autorun.py` — a loop that fires one fresh agent per ready item until nothing is left that an agent may do. The owner sees the board only then. See [What's new in v4](#whats-new-in-v4). (v3: per-module locks + the deploy queue, [below](#whats-new-in-v3).)
 
 A Claude Code skill (works with any agent runner that reads `SKILL.md`; the git hooks work with **no** agent at all) for running several AI agents in parallel on one working tree without them overwriting each other, dirtying `main`, or "forgetting" the protocol when a task feels small.
 
@@ -75,6 +75,17 @@ workflows:
   - finance/payroll/**
   - .claude/skills/payroll/**        # locks at finance/payroll/.goal — one lock per workflow home
 ```
+
+## What's new in v4
+
+**The owner is the last resort, not the scheduler.** After a signoff the system keeps working the board — a fresh agent process per item, one item per agent — until every remaining item genuinely waits on a human.
+
+- `lib/items.py` — status overlay over the file-derived board: `ready | in_progress | waiting_owner | done` (+ `waiting_world`, `parked`), `question` (required for `waiting_owner`: concrete question, 2–3 options, recommendation), `blocked_since`, `created_by`, `owner` (lock home by path). Dedup: no second open item with the same owner + normalized title (`Duplicate`; `scripts/handoff.py` exits 4).
+- `templates/blockers.md` — the configurable list of the ONLY reasons an item may wait on the owner (§12). Copy to `<repo>/.folder-lock/blockers.md`; `autorun.py` pastes it into every fired agent's prompt.
+- `scripts/autorun.py --runner "<agent command>"` — the loop (§13): per folder, skip if locked, own pointer first, `.firing.lock` with a minted id, fire, read back, three no-progress fires → `waiting_owner`; repeat until the ready queue is empty. `--once`, `--owner-prefix`, `--detach`. A dead runner never counts against an item.
+- `lib/autorun_log.py` — one line per autonomously worked item in `<folder>/workflow-state/autorun-log.md`; `digest` since the owner last looked.
+- Signoff (SKILL.md) gains three commands after release: `items.py from-pointer`, `autorun_log.py append`, `autorun.py --detach` — and stops inviting the owner's menu.
+- `tests/autorun_run.py` — seeded acceptance: plain ready, cross-folder creator, must-end-waiting_owner; asserts statuses, question, `created_by`, one log line per item, dedup refusal.
 
 ## What's new in v3
 

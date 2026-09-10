@@ -158,3 +158,20 @@ A single lock on a deployable app conflates two concerns: **edit conflicts** (re
 - **Rollback is a revert commit plus a new request** — never a hand-run deploy.
 
 Proof: `python scripts/deploy_selftest.py` — collapse, already-deployed, failure + back-off, dirty-tree block, guard warning, in a throwaway repo.
+
+## 12. Human blocker — the ONLY reasons an item waits on the owner [v4]
+
+An item is `waiting_owner` only for: a missing secret/credential/access; spending money or a contract; an irreversible external data side-effect (production push to an accounting/ERP system, unrecoverable delete/overwrite); a business decision with no spec and no precedent in the folder's `memory.md`; two materially different spec readings where a wrong pick costs more than asking. Explicitly NOT blockers: external e-mail, assigning work to another folder (handoff), ambiguity a reasonable default resolves — decide, log one dated line in `memory.md`, continue. The list is a template (`templates/blockers.md`); each installation edits its own copy. A `waiting_owner` item MUST carry a decision-ready `question` (question, 2–3 options, recommendation) — `lib/items.py wait` refuses without one.
+
+## 13. Autorun — the board is a work queue; the owner's view is the exit condition [v4]
+
+**Schema.** Every board item (a folder's pointer, a staged handoff) carries in `<state>/items.yaml` (`lib/items.py`): `status` (`ready` | `in_progress` | `waiting_owner` | `done`, plus `waiting_world` for tripwires on the world and `parked`), `question`, `blocked_since`, `created_by`, `owner` (lock home of the target path, by path only). Files stay the source of the work; the overlay is re-derived on every scan (`actionable` → ready, `WHEN <owner-condition>` → waiting_owner with an auto-drafted question until an agent writes a real one, `WHEN <world>` → waiting_world, `NONE` → done). Only the resumer sets `in_progress`; an agent's own question is never overwritten by an auto-drafted one.
+
+**Dedup.** No open item with the same `owner` + normalized title. `scripts/handoff.py` refuses (exit 4); `lib/items.py upsert` raises `Duplicate`. `--force` is the owner's.
+
+**Signoff writes the next step as an item.** After commit + release: `python lib/items.py from-pointer <folder>` (pointer → ready or waiting_owner + question), one line in `<folder>/workflow-state/autorun-log.md` (`lib/autorun_log.py append`: timestamp, folder, item, decisions, commit, status), then kick the loop (`scripts/autorun.py --detach`). The session does not render the owner's menu and does not continue working — one item per fired agent; process boundaries, not compaction.
+
+**Resumer loop** (`scripts/autorun.py --runner "<agent command>"`): per folder owning a `ready` item — skip while a fresh `LOCK.yaml`/`.firing.lock` exists (§1) → own pointer item first, else oldest ready → `in_progress` + `.firing.lock` with a minted agent id → fire ONE fresh agent process (prompt on stdin, `ICM_WINDOW`/`ICM_FOLDER`/`AUTORUN_ITEM*` in its env) → the agent works the item, applies §12, runs its own signoff → read back: unchanged → `fails+1`, three no-progress fires → `waiting_owner` with an auto question. Repeat until no `ready` item exists anywhere; no iteration/time/item cap. A dead runner is an infrastructure error, never counted against an item.
+
+**Exit condition.** The owner is shown the board only when `ready == 0`: `waiting_owner` items grouped by owner with question + `blocked_since`, plus the autorun-log digest since they last looked (`lib/autorun_log.py digest`). Invariants unchanged: HEAD always deployable (every fired agent starts from and commits to a clean state), one lock per folder routed by path, deploys via the §11 queue only.
+

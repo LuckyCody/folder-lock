@@ -45,6 +45,16 @@ Run it when **any** of: the lock's task is complete · the owner signals done ("
 3b. **Request the deploy, never run it** (PROTOCOL §11): `python <skill>/scripts/deploy_request.py --for <folder>`. If the folder is in a deploy unit (`.folder-lock/deploy-units.yaml`) this drops a request the single deployer collapses with everyone else's and ships as one deploy of HEAD; the result lands in `<folder>/workflow-state/deploys.jsonl`, a failure shows on the board. Outside every unit it prints "no deploy unit covers" and exits 0 — run it unconditionally.
 4. `python <skill>/scripts/lock.py release <folder>` — it verifies pointer mtime, working tree and handoffs, then deletes the lock. A refusal lists what is missing; fix it, don't force it.
 
+## After release — hand the next step to the loop (v4, PROTOCOL §13)
+
+```
+python lib/items.py from-pointer <folder>          # pointer -> board item: ready, or waiting_owner + your question
+python lib/autorun_log.py append <folder> --item "<title>" --status <ready|waiting_owner|done> --decisions "<defaults you decided>" --commit <sha>
+python scripts/autorun.py --runner "<agent command>" --detach
+```
+
+Do not render the owner's menu and do not start another item in this session: the loop fires a fresh agent per item. An item waits on the owner ONLY for the reasons in `blockers.md` (§12) — and then with a decision-ready question. Ambiguity with a reasonable default: decide, one dated line in the folder's `memory.md`, continue.
+
 ## Installing and proving the guards
 
 ```
