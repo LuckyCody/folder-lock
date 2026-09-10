@@ -148,6 +148,10 @@ def autorun(runner: str, owner_prefix: str = "", once: bool = False, timeout: in
                 (ROOT / owner / ".goal" / ".firing.lock").unlink(missing_ok=True)
             fired += 1; totals["fired"] += 1
             err = res.get("_error") or (f"exit {res.get('exit_code')}" if res.get("exit_code") not in (0, None) else "")
+            if res.get("_error"):
+                # transport-level failure (runner missing / crashed before any agent ran): infrastructure, never the item's fault
+                items.set_status(key, "ready"); log(f"  INFRA ERROR — {key} back to ready, pass aborted: {res['_error'][:160]}")
+                return totals
             e = items.load()["items"].get(key, {})
             if e.get("status") == "in_progress":
                 items.set_status(key, "ready"); items.sync(scan())

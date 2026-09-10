@@ -152,6 +152,8 @@ def set_status(key: str, status: str, question: str | None = None, error: str | 
     _apply_status(e, status, question, mint.timestamp())
     if error:
         e["last_error"] = error[:400]
+    if status == "ready":
+        e.pop("stuck", None); e["fails"] = 0; e.pop("last_error", None)
     save(data)
     return e
 
@@ -170,6 +172,7 @@ def record_fail(key: str, error: str, threshold: int = 3) -> dict:
                       f"Options: (a) rewrite the task so an agent can execute it; (b) do it yourself; (c) drop it. "
                       f"Recommendation: (a).", now)
         e["question_auto"] = True
+        e["stuck"] = True        # sync() keeps it on the owner; `items.py ready <key>` clears it
     else:
         _apply_status(e, "ready", None, now)
     save(data)
@@ -232,7 +235,7 @@ def sync(rows: list) -> dict:
             changed = norm_title(e.get("title", "")) != norm_title(title)
             e["title"], e["owner"] = title[:300], owner_of(folder)
             cur = e.get("status")
-            if cur == "in_progress" or (cur == "waiting_owner" and not e.get("question_auto") and not changed):
+            if cur == "in_progress" or (e.get("stuck") and not changed) or (cur == "waiting_owner" and not e.get("question_auto") and not changed):
                 pass
             elif cur != derived or changed:
                 keep_q = derived == "waiting_owner" and cur == "waiting_owner" and e.get("question") and not e.get("question_auto")

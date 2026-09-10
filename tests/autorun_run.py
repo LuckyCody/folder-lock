@@ -23,11 +23,13 @@ import items  # noqa: E402
 ROOT = lp.ROOT
 ALPHA, BETA = "_autorun-test-alpha", "_autorun-test-beta"
 PY = sys.executable
+# fixture handoffs must not land on the running session's binding (they are deleted with the fixture)
+TEST_ENV = {k: v for k, v in __import__('os').environ.items() if k != 'CLAUDE_CODE_SESSION_ID'}
 STUB = f'"{PY}" "{HERE / "autorun_stub_agent.py"}"'
 
 
 def sh(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run([PY, *args], cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return subprocess.run([PY, *args], cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8", errors="replace", env=TEST_ENV)
 
 
 def rmtree(p: Path) -> None:
