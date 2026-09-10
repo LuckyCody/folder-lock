@@ -104,6 +104,37 @@ record 11 $ok "--verify-wiring detects the disabled hook loudly"; git config cor
 section "12. Plain commit on main -> protect_main refuses"
 git checkout -q main; echo m > other/o.txt; git add other/o.txt; commit_as sess-b "on main"; ok=0; [ $LAST_RC -ne 0 ] && grep -q "protected branch" <<<"$LAST_OUT" && ok=1
 record 12 $ok "direct commit to main -> refused (MAIN_COMMIT_OK=1 to override deliberately)"
+git reset -q --hard; git checkout -q feat/work   # back to the work branch (fixture pointer lives there)
+
+section "13. Handoff record survives a binding rewrite (sidecar): release refuses the orphan; consume clears it"
+mkdir -p third/.goal; echo t > third/t.txt
+CLAUDE_CODE_SESSION_ID=sess-f $LOCK claim fixture --task "F stages a handoff" --hint window-f >>"$TR" 2>&1
+oH=$(CLAUDE_CODE_SESSION_ID=sess-f $PY _skill/scripts/handoff.py --to third --task "sidecar test handoff" --mode stage 2>&1); rH=$?
+NOTE=$(ls third/.goal/inbox/*.staged.md 2>/dev/null | head -1)
+CLAUDE_CODE_SESSION_ID=sess-f $LOCK claim fixture --task "F re-claims (binding rewritten)" >>"$TR" 2>&1
+SIDE=".goal/sessions/sess-f.handoffs.txt"
+side_ok=0; [ -f "$SIDE" ] && grep -q "^staged third/.goal/inbox/" "$SIDE" && ! grep -q "^handoff:" .goal/sessions/sess-f.yaml && side_ok=1
+rm -f "$NOTE"                                    # consumed by hand, no record -> must be flagged
+touch fixture/workflow-state/current-pointer.md  # pointer newer than the lock start, content unchanged (not dirty)
+oR1=$(CLAUDE_CODE_SESSION_ID=sess-f $LOCK release fixture 2>&1); rR1=$?
+oC=$(CLAUDE_CODE_SESSION_ID=sess-f $LOCK consume "$NOTE" 2>&1); rC=$?
+oR2=$(CLAUDE_CODE_SESSION_ID=sess-f $LOCK release fixture 2>&1); rR2=$?
+ok=0; [ $rH -eq 0 ] && [ -n "$NOTE" ] && [ $side_ok -eq 1 ] && [ $rR1 -eq 6 ] && grep -q "orphaned handoff" <<<"$oR1" && [ $rC -eq 0 ] && grep -q "^consumed " "$SIDE" && [ $rR2 -eq 0 ] && grep -q "RELEASED" <<<"$oR2" && ok=1
+LAST_OUT="stage exit $rH | sidecar+yaml-clean: $side_ok | release#1: $(first_line "$oR1") ($rR1) | consume: $(first_line "$oC" | cut -c1-40) | release#2: $(first_line "$oR2") ($rR2)"
+record 13 $ok "sidecar keeps the staged record across the binding rewrite; orphan refused (exit 6); consume -> released"
+log "      handoff.py: $(printf '%s' "$oH" | head -1 | cut -c1-120)"
+
+section "14. Folder claimed as its own lock domain, registry then folds it into a locked home -> literal lock honoured"
+oG=$(CLAUDE_CODE_SESSION_ID=sess-g $LOCK claim third --task "G owns third" --hint window-g 2>&1); rG=$?
+printf '  - third/**\n' >> .folder-lock/registry.yaml       # mid-session registry edit: third now belongs to other-flow (held by B)
+oK=$(CLAUDE_CODE_SESSION_ID=sess-g $LOCK check third 2>&1); rK=$?
+hook_edit sess-g third/t.txt; rE=$LAST_RC; oE="$LAST_OUT"
+hook_edit sess-b third/t.txt; rE2=$LAST_RC                      # B holds the registry home, NOT third's literal lock -> still refused
+mkdir -p third/workflow-state; printf 'Next concrete action: NONE\n' > third/workflow-state/current-pointer.md
+oL=$(CLAUDE_CODE_SESSION_ID=sess-g $LOCK release third --allow-dirty "fixture test" 2>&1); rL=$?
+ok=0; [ $rG -eq 0 ] && grep -q "YOURS third" <<<"$oK" && grep -q "LOCKED other" <<<"$oK" && [ $rE -eq 0 ] && [ $rE2 -ne 0 ] && [ $rL -eq 0 ] && grep -q "RELEASED third" <<<"$oL" && [ ! -f third/.goal/LOCK.yaml ] && ok=1
+LAST_OUT="claim $rG | check: YOURS third + LOCKED other: $(grep -c 'YOURS third\|LOCKED other' <<<"$oK")/2 | G edits third: exit $rE | B edits third: exit $rE2 | release: $(first_line "$oL") ($rL)"
+record 14 $ok "literal own lock survives a registry remap: check sees it, edit allowed for the holder only, release removes it"
 
 cd "$SK"; rm -rf "$TMP"
 section "summary"; ALL=1
@@ -115,5 +146,5 @@ res = [dict(zip(("n", "result", "name", "refusal"), r.split("|", 3))) for r in r
 json.dump({"ts": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), "all_pass": allok, "scenarios": res}, open(out, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
 print(f"recorded -> {out}")
 PYEOF
-[ "$ALL" = 1 ] && log "ALL 12 SCENARIOS PASS" || log "SOME SCENARIOS FAILED"
+[ "$ALL" = 1 ] && log "ALL 14 SCENARIOS PASS" || log "SOME SCENARIOS FAILED"
 [ "$ALL" = 1 ]

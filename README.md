@@ -1,5 +1,7 @@
 # folder-lock — many agents, one repo, no conflicting saves
 
+**v4.1.0** — the handoff ledger moves to an append-only sidecar (the binding YAML is identity only), `lock.py consume` records a handoff you staged and then did yourself, literal locks survive a registry remap ("the closest existing lock wins"), consumed placeholder notes leave the board, conflict test 14/14. See [What's new in v4.1](#whats-new-in-v41).
+
 **v4.0.0** — the board becomes a work queue: every item has `ready | in_progress | waiting_owner | done`, a decision-ready `question` when it waits on the owner, `created_by`/`owner` routing by path, a dedup rule, a per-folder autorun log, and `scripts/autorun.py` — a loop that fires one fresh agent per ready item until nothing is left that an agent may do. The owner sees the board only then. See [What's new in v4](#whats-new-in-v4). (v3: per-module locks + the deploy queue, [below](#whats-new-in-v3).)
 
 A Claude Code skill (works with any agent runner that reads `SKILL.md`; the git hooks work with **no** agent at all) for running several AI agents in parallel on one working tree without them overwriting each other, dirtying `main`, or "forgetting" the protocol when a task feels small.
@@ -75,6 +77,16 @@ workflows:
   - finance/payroll/**
   - .claude/skills/payroll/**        # locks at finance/payroll/.goal — one lock per workflow home
 ```
+
+## What's new in v4.1
+
+Two gaps that only show up once several sessions and a live registry share one repo.
+
+- **Handoff sidecar** — `.goal/sessions/<sid>.handoffs.txt`, append-only: `staged <path>` / `consumed <path>`. The binding YAML is regenerated on every claim/release and used to carry the `handoff:` lines too, so a filter bug could drop the ledger. `lib/lockpath.py` gains `record_handoff` / `read_handoffs` (sidecar first, legacy YAML lines after; `write_session` migrates them once). `scripts/handoff.py` writes to the sidecar; `lock.py release` reads it.
+- **`lock.py consume <note>`** — a session that staged a note, later claimed the target and did the work itself records the consumption (and deletes the note). Without the record `release` refuses with `orphaned handoff` (exit 6), as before. A note whose target folder is gone is nobody's orphan; a note deleted by the target's current holder is noted, not refused.
+- **Literal locks** — a folder claimed as its own lock domain and later folded into another home by a registry edit keeps its `LOCK.yaml`; `lockpath.literal_lock()` finds it and every guard honours it: the holder edits/commits/releases, everyone else (including the home's holder) gets `FOREIGN <folder> (literal lock)`. `lock.py check` shows both locks; `close/reopen/release/adopt` resolve to the literal lock when it is yours.
+- **Board hygiene** — `scripts/board.py` ignores inbox notes whose first line is `# CONSUMED …` (placeholders left for the folder's next visitor).
+- **Tests** — `tests/conflict_run.sh` scenarios 13 (sidecar survives a binding rewrite → orphan refused → consume → released) and 14 (registry remap → literal lock: check sees both, holder edits, home-holder refused, release removes it). 14/14.
 
 ## What's new in v4
 

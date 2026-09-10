@@ -59,7 +59,7 @@ python scripts/handoff.py --to <target folder> --task "<one line>" [--mode stage
 - **stage** (default): lands in `<target>/.goal/inbox/<minted>.staged.md`; whoever next claims the target reads its inbox first.
 - **fire**: additionally writes `<target>/.goal/state.yaml` (`status: in_progress`) for a headless runner. Refuses to clobber a live goal and refuses PARKED folders.
 - File-based invocation ONLY. Driving another agent's window with keystrokes is banned.
-- Every handoff is recorded on the writer's session binding; `lock.py release` refuses while one is orphaned (§9).
+- Every handoff is recorded in the writer's session **sidecar** `.goal/sessions/<session_id>.handoffs.txt` (append-only, one `staged <path>` / `consumed <path>` per line — v4.1; the binding YAML is rewritten on every claim/release and carries identity only). `lock.py release` refuses while a staged note of yours is gone without a record (§9). A session that stages a note, later claims the target itself and does the work records that with `python scripts/lock.py consume <note path>` (deletes the note too). A note whose target folder no longer exists (filed drop, test fixture) is nobody's orphan. A note whose first line is `# CONSUMED …` is a placeholder for the folder's next visitor to delete — the board never lists it.
 
 ## 3. Per-folder resume — the current pointer
 
@@ -85,6 +85,8 @@ Resume handle: read this file + workflow.yaml. Domain contract lives in <front d
 A session encountering uncommitted changes it did not make **stops and reports** — never builds on them, never `git add -A` / `git add .` across streams. Stage explicit paths only.
 
 `hooks/pre-commit` → `check_locks.py` refuses, and says why, when: a staged path sits under another window's fresh lock · under a guarded folder with no fresh lock of yours ("claim first") · in an unguarded folder ("claim it, which creates `.goal/`") · identity is missing or conflicting · the registry exists but is unreadable · **the hook is not actually wired** (git's hook dir ≠ the guard's dir — the silently-disabled case) · any internal error. Commit identity is automatic inside Claude Code (session binding); plain terminals prefix `ICM_WINDOW=<window> git commit …`. Foreign paths in your index → `git restore --staged <path>`. Owner-approved override only: `ICM_LOCK_BYPASS=1` (say so). `check_locks.py --self-test` proves the refusal in a fixture and records `.goal/selftest_last.json`.
+
+**Literal locks (v4.1) — the closest existing lock wins.** A folder claimed as its own lock domain keeps its `LOCK.yaml` even when a registry edit later folds it into another workflow's home. Both guards and `lock.py` honour that lock at the folder itself (or an ancestor below the resolved home): its holder may edit, commit and release there; everyone else — including the holder of the registry home — is refused (`FOREIGN <folder> (literal lock)`). `lock.py check <folder>` reports both the resolved domain and the literal lock when they differ; `close/reopen/release` operate on the literal lock when it carries your window (`adopt` also when the home has none). A lock above a registered workflow never governs it.
 
 ## 6. Dispatcher mode — fresh window, no folder claimed
 

@@ -142,6 +142,13 @@ def guard(repo: Path) -> int:
         locks = cache[key]
         mine = [li for li in locks if lp.same_window(li.window, me.window) and li.fresh]
         foreign = [li for li in locks if not lp.same_window(li.window, me.window) and (li.fresh or li.malformed)]
+        lit = lp.literal_lock(rel, res)
+        if lit is not None:  # v4.1: a fresh LOCK.yaml at the folder itself (registry moved the folder after the claim)
+            if lp.same_window(lit.window, me.window):
+                continue
+            lit_folder = lit.path.parent.parent.relative_to(lp.ROOT).as_posix()
+            problems.setdefault(f"FOREIGN {lit_folder} (literal lock): {lit.describe()}", []).append(rel)
+            continue
         if foreign:
             problems.setdefault(f"FOREIGN {res.folder or '<root>'}: {foreign[0].describe()}", []).append(rel)
         elif not mine:

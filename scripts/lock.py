@@ -11,8 +11,15 @@
   python scripts/lock.py reopen <folder> [--task ..]    closing -> open (task shifted)
   python scripts/lock.py release <folder> [--allow-dirty "<why>"]
         Refuses unless pointer mtime >= lock start, nothing uncommitted under the folder,
-        every handoff this session wrote still exists and is registered. Then deletes LOCK.yaml.
+        every handoff this session staged still exists and is registered (or is recorded as
+        consumed). Then deletes LOCK.yaml.
+  python scripts/lock.py consume <note path>            record that this session consumed a handoff
+        it staged (target folder must be yours or free); deletes the note. Without it, release
+        calls a vanished note an orphan (v4.1 — records live in the sidecar <sid>.handoffs.txt).
   python scripts/lock.py check <folder> | whoami | mine | status
+        check reports the resolved lock domain AND the folder's own LOCK.yaml when a registry
+        edit moved the folder after it was claimed (literal lock, v4.1); close/reopen/release/adopt
+        operate on that literal lock when it carries your window.
 
 Identity in Claude Code: the Bash tool exposes CLAUDE_CODE_SESSION_ID and hooks get the
 same value as `session_id`; the binding maps it to the window, so no ICM_WINDOW export is
@@ -63,6 +70,53 @@ def _lock_dir_for(rel: str) -> Path:
 def _rel_of(lock_dir: Path) -> str:
     r = lock_dir.parent.relative_to(ROOT).as_posix()
     return "" if r == "." else r
+
+
+def _literal_lock_dir(rel: str, resolved: Path, me, adopt: bool = False):
+    """The folder's OWN .goal/ when it differs from the resolved home AND holds a LOCK.yaml that is
+    (a) mine, or (b) for adopt: any interactive lock while the resolved home has none. A registry edit
+    that folds a claimed folder into another home must not orphan its lock (v4.1)."""
+    if not rel:
+        return None
+    literal = ROOT / rel / ".goal"
+    if literal.resolve() == resolved.resolve() or not (literal / "LOCK.yaml").is_file():
+        return None
+    mine = [li for li in lp.locks_at(literal) if li.kind == "interactive" and me and lp.same_window(li.window, me.window)]
+    if mine:
+        return literal
+    if adopt and not any(li.kind == "interactive" for li in lp.locks_at(resolved)):
+        return literal
+    return None
+
+
+def _lock_dir_for_folder(rel: str, me=None, adopt: bool = False) -> Path:
+    """The lock domain a FOLDER belongs to: registry home if registered, else itself — unless a
+    literal LOCK.yaml of the caller's own window sits at the folder itself (see _literal_lock_dir)."""
+    resolved = _lock_dir_for(rel)
+    literal = _literal_lock_dir(rel, resolved, me, adopt)
+    if literal is not None:
+        print(f"note: {rel} now resolves to {_rel_of(resolved) or '<root>'} in the registry, but its own LOCK.yaml carries "
+              f"{'your' if me else 'an adoptable'} window — operating on the literal lock {rel}/.goal/LOCK.yaml")
+        return literal
+    return resolved
+
+
+def _session_handoffs() -> list:
+    """Handoffs this session STAGED and has not itself CONSUMED (sidecar records; v4.1)."""
+    sid = _sid()
+    if not sid:
+        return []
+    records = lp.read_handoffs(sid)
+    consumed = {rel for kind, rel in records if kind == "consumed"}
+    out = []
+    for kind, rel in records:
+        if kind != "staged" or rel in consumed or rel in out:
+            continue
+        target = rel.split("/.goal/", 1)[0]
+        if not (ROOT / target).is_dir():
+            continue  # target folder gone (fixture, filed drop): nothing left to be orphaned in
+        out.append(rel)
+    return out
 
 
 def _report(lock_dir: Path, me) -> int:
@@ -166,7 +220,7 @@ def cmd_claim(a) -> int:
 
 
 def cmd_adopt(a) -> int:
-    lock_dir = _lock_dir_for(_folder(a.folder))
+    lock_dir = _lock_dir_for_folder(_folder(a.folder), _me(), adopt=True)
     locks = [li for li in lp.locks_at(lock_dir) if li.kind == "interactive"]
     if not locks:
         print(f"ERROR: no LOCK.yaml at {lock_dir} to adopt — claim instead.", file=sys.stderr)
@@ -188,11 +242,11 @@ def cmd_adopt(a) -> int:
 
 
 def _set_status(folder: str, new: str, task: str = "", stream: str = "") -> int:
-    lock_dir = _lock_dir_for(_folder(folder))
     me = _me()
     if me is None:
         print(f"ERROR: {lp.NO_IDENTITY_HELP}", file=sys.stderr)
         return 5
+    lock_dir = _lock_dir_for_folder(_folder(folder), me)
     locks = [li for li in lp.locks_at(lock_dir) if lp.same_window(li.window, me.window)]
     if not locks:
         print(f"ERROR: no lock of yours at {lock_dir}", file=sys.stderr)
@@ -218,12 +272,12 @@ def cmd_reopen(a) -> int:
 
 
 def cmd_release(a) -> int:
-    lock_dir = _lock_dir_for(_folder(a.folder))
-    home = _rel_of(lock_dir)
     me = _me()
     if me is None:
         print(f"ERROR: {lp.NO_IDENTITY_HELP}", file=sys.stderr)
         return 5
+    lock_dir = _lock_dir_for_folder(_folder(a.folder), me)
+    home = _rel_of(lock_dir)
     locks = lp.locks_at(lock_dir)
     if not locks:
         print(f"nothing to release at {lock_dir}")
@@ -239,11 +293,19 @@ def cmd_release(a) -> int:
         problems.append(f"no pointer: {ptr.relative_to(ROOT).as_posix()} does not exist — write it (PROTOCOL §3)")
     elif li.started and datetime.fromtimestamp(ptr.stat().st_mtime) < li.started:
         problems.append(f"pointer not updated since lock start {li.started.strftime(lp.TS_FMT)}: {ptr.relative_to(ROOT).as_posix()}")
-    sid = _sid()
-    for h in (lp.read_session(sid).get("handoffs", []) if sid else []):
+    for h in _session_handoffs():
         hp = ROOT / h
         if not hp.exists():
-            problems.append(f"orphaned handoff: {h} was written this session but is gone")
+            # a vanished note whose target folder is freshly held by ANOTHER window was consumed by that
+            # holder — the target's own signoff records it; not this session's orphan (v4.1)
+            tgt = h.split("/.goal/", 1)[0]
+            foreign = [x for x in lp.locks_at(ROOT / tgt / ".goal") if not lp.same_window(x.window, me.window)] \
+                if (ROOT / tgt).is_dir() else []
+            if foreign:
+                print(f"note: handoff {h} consumed by the current holder of {tgt} ({foreign[0].window}) — not an orphan")
+                continue
+            problems.append(f"orphaned handoff: {h} was written this session but is gone "
+                            f"(consumed without a record? python scripts/lock.py consume {h})")
             continue
         try:
             idx = lp.INBOX_INDEX.read_text(encoding="utf-8").splitlines()
@@ -274,7 +336,46 @@ def cmd_release(a) -> int:
 
 
 def cmd_check(a) -> int:
-    return _report(_lock_dir_for(_folder(a.folder)), _me())
+    rel = _folder(a.folder)
+    me = _me()
+    resolved = _lock_dir_for(rel)
+    code = _report(resolved, me)
+    literal = ROOT / rel / ".goal" if rel else None
+    if literal is not None and literal.resolve() != resolved.resolve() and (literal / "LOCK.yaml").is_file():
+        print(f"note: {rel} also carries its OWN LOCK.yaml (registry maps the folder to {_rel_of(resolved) or '<root>'}):")
+        code = max(code, _report(literal, me))
+    return code
+
+
+def cmd_consume(a) -> int:
+    """Record that THIS session consumed a handoff it staged (the target folder must be yours or free)."""
+    me = _me()
+    if me is None:
+        print(f"ERROR: {lp.NO_IDENTITY_HELP}", file=sys.stderr)
+        return 5
+    rel = a.path.replace("\\", "/").strip("/")
+    target = rel.split("/.goal/", 1)[0]
+    locks = lp.locks_at(ROOT / target / ".goal") if (ROOT / target).is_dir() else []
+    fresh_foreign = [li for li in locks if not lp.same_window(li.window, me.window) and li.fresh]
+    mine = [li for li in locks if lp.same_window(li.window, me.window)]
+    if fresh_foreign and not mine:
+        print(f"REFUSED: {target} is held by window {fresh_foreign[0].window!r} — only the holder (or you, after claiming) may record consumption.")
+        return 1
+    if not mine:
+        print(f"note: {target} is not locked by anyone — recording consumption without a holder")
+    if rel not in _session_handoffs():
+        print(f"nothing to do: {rel} is not an unconsumed handoff of this session")
+        return 0
+    lp.record_handoff(_sid(), "consumed", rel)
+    if (ROOT / rel).exists():
+        try:
+            (ROOT / rel).unlink()
+            print(f"consumed + deleted {rel}")
+        except OSError as e:
+            print(f"consumed (file left in place: {e}) {rel}")
+    else:
+        print(f"consumed {rel} (file already gone)")
+    return 0
 
 
 def cmd_whoami(a) -> int:
@@ -300,8 +401,8 @@ def cmd_mine(a) -> int:
         for li in lp.locks_at(ROOT / (f if f != "." else "") / ".goal"):
             if lp.same_window(li.window, me.window):
                 print(f"{f}: {li.describe()}")
-    for h in sess.get("handoffs", []):
-        print(f"handoff written: {h}")
+    for h in _session_handoffs():
+        print(f"handoff staged (unconsumed): {h}")
     return 0
 
 
@@ -332,6 +433,8 @@ def main() -> int:
     g = sub.add_parser("release"); g.add_argument("folder"); g.add_argument("--allow-dirty", default="")
     g.add_argument("--force", action="store_true"); g.set_defaults(fn=cmd_release)
     h = sub.add_parser("check"); h.add_argument("folder"); h.set_defaults(fn=cmd_check)
+    k = sub.add_parser("consume", help="record that this session consumed a handoff it staged (target folder yours or free)")
+    k.add_argument("path", help="repo-relative path of the .staged.md / .fired.md note"); k.set_defaults(fn=cmd_consume)
     sub.add_parser("whoami").set_defaults(fn=cmd_whoami)
     sub.add_parser("mine").set_defaults(fn=cmd_mine)
     sub.add_parser("status").set_defaults(fn=cmd_status)

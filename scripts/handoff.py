@@ -104,13 +104,8 @@ def main() -> int:
     except Exception as _e:
         print(f"(item not recorded: {_e})", file=sys.stderr)
     sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
-    if sid:
-        try:
-            lp.SESSIONS.mkdir(parents=True, exist_ok=True)
-            with lp.session_file(sid).open("a", encoding="utf-8") as fh:
-                fh.write(f'handoff: "{note.relative_to(ROOT).as_posix()}"\n')
-        except OSError:
-            pass
+    if sid:  # sidecar ledger (v4.1): survives every rewrite of the binding YAML; release checks it
+        lp.record_handoff(sid, "staged", note.relative_to(ROOT).as_posix())
     if mode == "fire":
         (target / ".goal" / "state.yaml").write_text(
             f"goal: {_yaml_str(a.task + ' (handoff from ' + (a.source or 'dispatcher') + ' - read .goal/inbox/' + note.name + ' first)')}\n"

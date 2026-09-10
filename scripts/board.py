@@ -31,6 +31,16 @@ def fmt_age(td) -> str:
     return f"{h}h{rem // 60:02d}m"
 
 
+def _first_line(p: Path) -> str:
+    try:
+        for raw in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            if raw.strip():
+                return raw.strip()
+    except OSError:
+        pass
+    return ""
+
+
 def classify(action: str):
     a = action.strip(); low = a.lower()
     if not a:
@@ -68,7 +78,10 @@ def scan(root: Path) -> list:
                                 "age": fmt_age(li.age), "fresh": li.fresh} for li in locks]
             inbox = p / "inbox"
             if inbox.is_dir():
-                it["handoffs"] = [f.name for f in sorted(inbox.glob("*.staged.md"))]
+                # a note whose first line is "# CONSUMED ..." is a placeholder (consumed, left for the
+                # folder's next visitor to delete — PROTOCOL §2), never open work (v4.1)
+                it["handoffs"] = [f.name for f in sorted(inbox.glob("*.staged.md"))
+                                  if not _first_line(f).upper().startswith("# CONSUMED")]
             dirnames[:] = []
         elif p.name == "workflow-state" and "current-pointer.md" in filenames:
             rel = p.parent.relative_to(root).as_posix() or "."

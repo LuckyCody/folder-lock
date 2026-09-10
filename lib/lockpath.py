@@ -22,6 +22,15 @@ Identity:
      `scripts/lock.py claim|adopt`; session_id = hook stdin `session_id`, or in
      Bash-run scripts Claude Code's CLAUDE_CODE_SESSION_ID env var.
   Both present and different -> IdentityConflict. Neither -> None (guards refuse).
+  The binding YAML is identity only. Handoff records (`staged <path>` / `consumed <path>`)
+  live in the append-only sidecar `<session_id>.handoffs.txt` next to it (v4.1) — the YAML
+  is rewritten on every claim/release and must never carry a ledger.
+
+Literal locks (v4.1): a folder claimed as its own lock domain and later folded into another
+  home by a registry edit keeps its `LOCK.yaml`. `literal_lock()` finds the closest fresh
+  interactive lock at the path's own folder (or an ancestor below the resolved home); every
+  guard honours it — "the closest existing lock wins": its holder may edit, everyone else
+  (including the holder of the registry home) is refused.
 
 Freshness: LOCK.yaml stale after 24h (by `started:`), .firing.lock stale after 15min
 (by mtime). Missing `status:` = open (pre-status locks). Regex parsing — no PyYAML.
@@ -334,20 +343,68 @@ def read_session(session_id: str) -> dict:
         return {}
     info = parse_lock_text(text)
     info["folders"] = [f.strip().strip('"') for f in re.findall(r"^\s+-\s+(.+?)\s*$", text, re.M)]
-    info["handoffs"] = re.findall(r'^handoff:\s*"?(.+?)"?\s*$', text, re.M)
     return info
+
+
+_LEGACY_HANDOFF = re.compile(r'^(handoff|consumed):\s*"?(.+?)"?\s*$', re.M)
+
+
+def handoffs_file(session_id: str) -> Path:
+    """Append-only sidecar next to the binding: one record per line, `staged <path>` / `consumed <path>`."""
+    return session_file(session_id).with_suffix(".handoffs.txt")
+
+
+def _legacy_handoff_lines(text: str) -> list:
+    """(kind, path) pairs from pre-sidecar bindings (`handoff:` / `consumed:` lines in the YAML)."""
+    return [("staged" if k == "handoff" else "consumed", v.strip()) for k, v in _LEGACY_HANDOFF.findall(text)]
+
+
+def record_handoff(session_id: str, kind: str, rel: str) -> None:
+    """kind: 'staged' | 'consumed'; rel: repo-relative POSIX path of the note. Never raises on I/O."""
+    if kind not in ("staged", "consumed"):
+        raise ValueError(f"record_handoff kind {kind!r}")
+    try:
+        SESSIONS.mkdir(parents=True, exist_ok=True)
+        with handoffs_file(session_id).open("a", encoding="utf-8") as fh:
+            fh.write(f"{kind} {rel.replace(chr(92), '/').strip('/')}\n")
+    except OSError:
+        pass
+
+
+def read_handoffs(session_id: str) -> list:
+    """Ordered (kind, path) records of this session: sidecar first, then any legacy lines still
+    sitting in the YAML (a binding written before the sidecar existed)."""
+    out = []
+    try:
+        for raw in handoffs_file(session_id).read_text(encoding="utf-8").splitlines():
+            parts = raw.strip().split(" ", 1)
+            if len(parts) == 2 and parts[0] in ("staged", "consumed"):
+                out.append((parts[0], parts[1].strip()))
+    except OSError:
+        pass
+    try:
+        out += _legacy_handoff_lines(session_file(session_id).read_text(encoding="utf-8"))
+    except OSError:
+        pass
+    return out
 
 
 def write_session(session_id: str, window: str, folders: list, extra: Optional[dict] = None) -> Path:
     SESSIONS.mkdir(parents=True, exist_ok=True)
     p = session_file(session_id)
-    keep = []
+    # legacy bindings carried `handoff:` / `consumed:` lines inline; move them to the sidecar once,
+    # then the YAML holds identity only (the rewrite can no longer lose a record)
     try:
-        keep = [l for l in p.read_text(encoding="utf-8").splitlines() if l.startswith("handoff:")]
+        legacy = _legacy_handoff_lines(p.read_text(encoding="utf-8"))
     except OSError:
-        pass
+        legacy = []
+    if legacy:
+        already = set(read_handoffs(session_id)) - set(legacy)
+        for kind, rel in legacy:
+            if (kind, rel) not in already:
+                record_handoff(session_id, kind, rel)
     lines = [f'window: "{window}"', f'session_id: "{session_id}"',
-             f'bound: "{datetime.now().strftime(TS_FMT)}"'] + keep
+             f'bound: "{datetime.now().strftime(TS_FMT)}"']
     for k, v in (extra or {}).items():
         lines.append(f'{k}: "{v}"')
     lines.append("folders:")
@@ -383,14 +440,53 @@ NO_IDENTITY_HELP = (
 
 # ----------------------------------------------------------------------------- whitelist + log
 
+def literal_lock(rel: str, res: Optional[Resolution] = None, now: Optional[datetime] = None) -> Optional[LockInfo]:
+    """The CLOSEST fresh interactive LOCK.yaml sitting at the literal `.goal/` of `rel` (when rel is a
+    folder) or of one of its ancestor folders — excluding the resolved lock dir itself (the normal
+    path already saw it) and any folder that is a strict ancestor of the resolved home (a lock above
+    a registered workflow never governs it). Exists for the registry-remap case: a folder claimed as
+    its own lock domain and later folded into another home by a registry edit keeps its lock — the
+    holder keeps working, everyone else (including the home's holder) is refused, because the most
+    specific existing lock wins. None when nothing qualifies."""
+    rel = rel.replace("\\", "/").strip("/")
+    parts = rel.split("/") if rel else []
+    skip = res.lock_dir.resolve() if (res is not None and res.lock_dir is not None) else None
+    home = (res.folder or "").strip("/") if res is not None else ""
+    for i in range(len(parts), 0, -1):
+        folder = "/".join(parts[:i])
+        cand = ROOT / folder / ".goal"
+        if not cand.is_dir():
+            continue
+        if skip is not None and cand.resolve() == skip:
+            continue
+        if home and home.startswith(folder + "/"):
+            continue  # ancestor of the resolved home: not a candidate
+        for li in locks_at(cand, now):
+            if li.kind == "interactive" and not li.malformed and li.fresh:
+                return li
+    return None
+
+
+def own_literal_lock(rel: str, me: Optional[Identity], res: Optional[Resolution] = None,
+                     now: Optional[datetime] = None) -> Optional[LockInfo]:
+    """literal_lock() when it carries MY window, else None."""
+    if me is None:
+        return None
+    li = literal_lock(rel, res, now)
+    return li if (li is not None and same_window(li.window, me.window)) else None
+
+
 def is_whitelisted(rel: str, res: Resolution, me: Optional[Identity]) -> str:
     parts = rel.split("/")
     if ".goal" in parts:
         return ".goal/ runtime carrier"
-    if "workflow-state" in parts and me is not None and res.lock_dir is not None:
-        for li in locks_at(res.lock_dir):
-            if li.kind == "interactive" and same_window(li.window, me.window):
-                return "workflow-state/ under own lock"
+    if "workflow-state" in parts and me is not None:
+        if res.lock_dir is not None:
+            for li in locks_at(res.lock_dir):
+                if li.kind == "interactive" and same_window(li.window, me.window):
+                    return "workflow-state/ under own lock"
+        if own_literal_lock(rel, me, res) is not None:
+            return "workflow-state/ under own literal lock (registry remapped the folder)"
     return ""
 
 
