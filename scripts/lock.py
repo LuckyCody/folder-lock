@@ -1,11 +1,14 @@
-"""Lock writer — claim / adopt / close / reopen / release / check / whoami / mine / status
-(PROTOCOL.md §1, §1b, §9). Nobody writes LOCK.yaml by hand.
+"""Lock writer — claim / adopt / close / reopen / release / check / consume / reader / who / whoami / mine / status
+(PROTOCOL.md §1, §1b, §9, §15, §16). Nobody writes LOCK.yaml by hand.
 
   python scripts/lock.py claim <folder> --task "<one line>" [--stream S] [--hint word]
         Free -> mints a window (lib/mint.py), writes LOCK.yaml status: open, binds
-        CLAUDE_CODE_SESSION_ID -> window in <repo>/.goal/sessions/, prints the identity line.
-        Fresh foreign lock -> exit 1 (`closing` is reported as "signing off", never stale);
-        stale -> exit 2 (ask the owner; --force-stale after they agreed); fresh .firing.lock -> exit 3.
+        CLAUDE_CODE_SESSION_ID -> window in <STATE_ROOT>/sessions/, prints the identity line,
+        the pointer's read-coverage proof and the cross-host rules-hash line (§15).
+        Fresh foreign lock -> exit 1 (`closing` is reported as "signing off", never stale; LOCKED names the
+        holder's peer address — message them first, §16); stale -> exit 2 (ask the owner; --force-stale after
+        they agreed); fresh .firing.lock -> exit 3; a divergent sync conflict copy of a load-bearing file
+        outside the folder -> exit 5 (fold it first, §15). Safe conflict-copy classes are folded by the claim.
   python scripts/lock.py adopt <folder> [--window W]   bind an existing lock to this session
   python scripts/lock.py close <folder>                 open -> closing (task judged complete)
   python scripts/lock.py reopen <folder> [--task ..]    closing -> open (task shifted)
@@ -16,10 +19,16 @@
   python scripts/lock.py consume <note path>            record that this session consumed a handoff
         it staged (target folder must be yours or free); deletes the note. Without it, release
         calls a vanished note an orphan (v4.1 — records live in the sidecar <sid>.handoffs.txt).
+  python scripts/lock.py reader [--hint menu]           READER identity: a window with no lock and no folder,
+        so a menu-only session's state writes carry an author (v4.2). Edits stay denied; the Stop hook passes;
+        `claim` replaces the reader binding with a real window.
+  python scripts/lock.py who [--json]                   every lock -> window -> session -> holder's ListAgents
+        name + live/GONE/exited/headless (lib/peers.py, §16) — who to message, never a broadcast.
   python scripts/lock.py check <folder> | whoami | mine | status
         check reports the resolved lock domain AND the folder's own LOCK.yaml when a registry
-        edit moved the folder after it was claimed (literal lock, v4.1); close/reopen/release/adopt
-        operate on that literal lock when it carries your window.
+        edit moved the folder after it was claimed (literal lock, v4.1), then runs the conflict-copy
+        scan dry (exit 5 on a blocking copy, nothing deleted); close/reopen/release/adopt operate on
+        that literal lock when it carries your window.
 
 Identity in Claude Code: the Bash tool exposes CLAUDE_CODE_SESSION_ID and hooks get the
 same value as `session_id`; the binding maps it to the window, so no ICM_WINDOW export is
@@ -28,6 +37,7 @@ needed. Plain terminals and headless agents set ICM_WINDOW=<window> instead.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import subprocess
@@ -119,8 +129,57 @@ def _session_handoffs() -> list:
     return out
 
 
+# ----------------------------------------------------------------------------- §15 / §16 helpers
+
+def _holder_info(window: str) -> tuple:
+    """(one-line holder description, state) via lib/peers.py — §16: who to message before staging a handoff."""
+    try:
+        import peers
+        h = peers.holder(window)
+    except Exception as e:  # noqa: BLE001 — the report must never die on the lookup
+        return f"(holder lookup unavailable: {e})", "unknown"
+    st = h.get("state", "unbound-here")
+    sid8 = (h.get("session_id") or "")[:8]
+    if st == "live":
+        return f"{h['name']} · live (session {sid8}, pid {h['pid']}) — SendMessage to '{h['name']}'", st
+    if st == "gone":
+        return f"{h.get('name') or sid8} · GONE (pid {h['pid']} exited) — orphaned lock", st
+    if st == "exited":
+        return f"session {sid8} · exited (bound here, no live Claude Code process) — orphaned lock", st
+    if st == "fired":
+        return f"headless agent · session {sid8} (not addressable)", st
+    if st == "unknown":
+        return f"{h.get('name') or '?'} · liveness unknown", st
+    return "unbound here (other host / plain terminal / headless agent) — nothing to message", st
+
+
+def _pointer_proof(home_rel: str) -> None:
+    """§15 read-coverage proof, printed at claim time: size + sha256 of the pointer and its action line VERBATIM,
+    so the load-bearing line is in the session's context even if a later Read slices the file."""
+    p = ROOT / home_rel / "workflow-state" / "current-pointer.md" if home_rel else ROOT / "workflow-state" / "current-pointer.md"
+    shown = f"{home_rel + '/' if home_rel else ''}workflow-state/current-pointer.md"
+    if not p.is_file():
+        print(f"pointer: none yet at {shown} — the signoff writes it (PROTOCOL §3)")
+        return
+    try:
+        b = p.read_bytes()
+    except OSError as e:
+        print(f"pointer: unreadable ({e})")
+        return
+    lines = b.decode("utf-8", "replace").splitlines()
+    print(f"pointer: {len(lines)} lines · {len(b)} B · sha256 {hashlib.sha256(b).hexdigest()[:12]} — read it IN FULL "
+          f"(a Read with offset/limit is reported as PARTIAL by the read guard)")
+    for i, l in enumerate(lines, 1):
+        if l.startswith("Next concrete action:"):
+            print(f"pointer L{i}: {l}")
+            break
+    else:
+        print("pointer: NO `Next concrete action:` line — invalid grammar (PROTOCOL §3); fix before signoff")
+
+
 def _report(lock_dir: Path, me) -> int:
     rel = _rel_of(lock_dir) or "<root>"
+    to = _rel_of(lock_dir) or "."
     locks = lp.locks_at(lock_dir)
     if not locks:
         print(f"FREE {rel}")
@@ -135,15 +194,31 @@ def _report(lock_dir: Path, me) -> int:
             print(f"YOURS {rel}: {li.describe()}")
         elif li.kind == "fired":
             if li.fresh:
-                print(f"AGENT HOLDS {rel}: {li.describe()} — wait or stage a handoff (python scripts/handoff.py --to {rel} ...)")
+                print(f"AGENT HOLDS {rel}: {li.describe()} — wait or stage a handoff (python scripts/handoff.py --to {to} ...)")
                 code = max(code, 3)
             else:
                 print(f"note: stale .firing.lock in {rel} ({li.describe()}) — a headless run died; its runner should clear it")
         elif li.fresh and li.status == "closing":
-            print(f"SIGNING OFF {rel}: {li.describe()} — the holder is mid-signoff, not stale. Do not take over.")
+            line, _ = _holder_info(li.window)
+            print(f"SIGNING OFF {rel}: {li.describe()} — the holder is mid-signoff, not stale. Do not take over.\n  Holder: {line}")
             code = max(code, 1)
         elif li.fresh:
-            print(f"LOCKED {rel}: {li.describe()}\n  -> STOP. Another session holds this folder. Stage a handoff instead of editing here.")
+            line, state = _holder_info(li.window)
+            if state in ("live", "unknown"):
+                action = (f"  -> STOP editing here — but do not park the work. MESSAGE THE HOLDER first (PROTOCOL §16): "
+                          f"'you hold {li.window} on {rel}: release ETA, or hand it over?' — same-machine sessions answer within "
+                          f"a minute. Stage a handoff (python scripts/handoff.py --to {to} ...) only when the holder says 'not soon'.")
+            elif state == "fired":
+                action = (f"  -> STOP editing here. A headless agent holds it (no peer address): wait for its lock to clear or "
+                          f"stage a handoff (python scripts/handoff.py --to {to} ...).")
+            elif state in ("gone", "exited"):
+                action = ("  -> STOP editing here. The holder session is gone — this is an ORPHANED lock (§1): ask the owner "
+                          "before taking over (claim --force-stale only after they agree); never silently proceed.")
+            else:
+                action = (f"  -> STOP editing here. No binding on this host (other host / plain terminal): stage a handoff "
+                          f"(python scripts/handoff.py --to {to} ...) — nothing here can be messaged.")
+            print(f"LOCKED {rel}: {li.describe()}\n  Holder: {line}\n{action}\n"
+                  f"  `python scripts/lock.py who` lists every lock with its holder.")
             code = max(code, 1)
         else:
             print(f"STALE {rel}: {li.describe()}\n  -> Ask the owner before taking over. Never silently proceed over a stale lock.")
@@ -178,6 +253,20 @@ def _bind(window: str, folder_rel: str, add: bool = True) -> None:
     lp.write_session(sid, window, folders, {"user": os.environ.get("USERNAME") or os.environ.get("USER") or ""})
 
 
+def bind_reader(sid: str, hint: str = "menu") -> str:
+    """READER identity (v4.2): a window with NO lock and NO folder, so a menu-only session's state writes (seen
+    stamp, guard log) carry an author. Idempotent: an existing binding of any kind is kept. Returns the window."""
+    if not sid:
+        return ""
+    cur = lp.read_session(sid)
+    if cur.get("window"):
+        return str(cur["window"]).strip()
+    window = mint.window(hint or "menu")
+    lp.write_session(sid, window, [], extra={"user": os.environ.get("USERNAME") or os.environ.get("USER") or "", "kind": "reader"})
+    lp.guard_log({"guard": "lock", "event": "reader", "window": window, "session_id": sid})
+    return window
+
+
 def _write_lock(lock_file: Path, window: str, task: str, stream: str, status: str, started: str) -> None:
     lock_file.parent.mkdir(parents=True, exist_ok=True)
     branch = _git("symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip() or "detached"
@@ -204,6 +293,20 @@ def cmd_claim(a) -> int:
     if state == 2 and not a.force_stale:
         print("  (re-run with --force-stale once the owner has agreed)")
         return 2
+    try:
+        import conflicts
+        blocking = conflicts.gate(home, apply=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"conflict-copy scan skipped ({type(e).__name__}: {e}) — copies UNVERIFIED")
+        blocking = []
+    if blocking:
+        print(f"REFUSED: claim of {home or '<root>'} blocked by {len(blocking)} divergent conflict cop{'y' if len(blocking) == 1 else 'ies'} "
+              f"of load-bearing files (PROTOCOL §15). Fold them, then claim again.")
+        return 5
+    if me and _sid() and lp.is_reader(_sid()):
+        # a menu-only READER binding (no lock, no folder) is upgraded, never reused as a lock window
+        print(f"note: replacing reader identity {me.window!r} with a real window (browsing -> claiming).")
+        me = None
     if me:
         window = me.window
         print(f"note: this session already holds window {me.window!r} — claiming {home or '<root>'} under the same identity "
@@ -216,6 +319,13 @@ def cmd_claim(a) -> int:
     print(f"CLAIMED {home or '<root>'} · window={window} · status=open · started={started}")
     print(f"identity: bound to Claude session {_sid() or '(none)'} — hooks + pre-commit resolve it automatically.")
     print(f"plain terminal / headless equivalent: ICM_WINDOW={window}")
+    _pointer_proof(home)
+    try:
+        import rules_hash
+        for l in rules_hash.brief(do_publish=True).splitlines():
+            print(l)
+    except Exception as e:  # noqa: BLE001
+        print(f"rules: hash check skipped ({type(e).__name__}: {e}) — bytes across hosts UNVERIFIED")
     return 0
 
 
@@ -230,7 +340,7 @@ def cmd_adopt(a) -> int:
         print(f"ERROR: lock window is {li.window!r}, you said {a.window!r}.", file=sys.stderr)
         return 1
     me = _me()
-    if me and not lp.same_window(me.window, li.window):
+    if me and not lp.same_window(me.window, li.window) and not (_sid() and lp.is_reader(_sid())):
         print(f"ERROR: this session is already {me.window!r}; release it before adopting {li.window!r}.", file=sys.stderr)
         return 5
     if "status:" not in li.path.read_text(encoding="utf-8", errors="replace"):
@@ -293,7 +403,15 @@ def cmd_release(a) -> int:
         problems.append(f"no pointer: {ptr.relative_to(ROOT).as_posix()} does not exist — write it (PROTOCOL §3)")
     elif li.started and datetime.fromtimestamp(ptr.stat().st_mtime) < li.started:
         problems.append(f"pointer not updated since lock start {li.started.strftime(lp.TS_FMT)}: {ptr.relative_to(ROOT).as_posix()}")
-    for h in _session_handoffs():
+    staged = _session_handoffs()
+    idx = None
+    if staged:
+        try:
+            import statestore
+            idx = statestore.inboxes()          # §14: the inbox index is a state-store document (cache when offline)
+        except Exception as e:  # noqa: BLE001
+            print(f"note: inbox index unavailable ({e}) — handoff registration not verified")
+    for h in staged:
         hp = ROOT / h
         if not hp.exists():
             # a vanished note whose target folder is freshly held by ANOTHER window was consumed by that
@@ -307,12 +425,8 @@ def cmd_release(a) -> int:
             problems.append(f"orphaned handoff: {h} was written this session but is gone "
                             f"(consumed without a record? python scripts/lock.py consume {h})")
             continue
-        try:
-            idx = lp.INBOX_INDEX.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            idx = []
-        if h.split("/.goal/", 1)[0] not in idx:
-            problems.append(f"handoff {h} not registered in .goal/inboxes.txt — the next session would never see it")
+        if idx is not None and h.split("/.goal/", 1)[0] not in idx:
+            problems.append(f"handoff {h} not registered in the inbox index (state store `inboxes`) — the next session would never see it")
         ignored = _git("check-ignore", "-q", h).returncode == 0
         if not ignored and _git("status", "--porcelain", "--", h).stdout.strip():
             problems.append(f"handoff {h} is tracked but uncommitted — commit it before releasing")
@@ -344,6 +458,12 @@ def cmd_check(a) -> int:
     if literal is not None and literal.resolve() != resolved.resolve() and (literal / "LOCK.yaml").is_file():
         print(f"note: {rel} also carries its OWN LOCK.yaml (registry maps the folder to {_rel_of(resolved) or '<root>'}):")
         code = max(code, _report(literal, me))
+    try:
+        import conflicts
+        if conflicts.gate(_rel_of(resolved), apply=False):   # dry: reports, never deletes
+            code = max(code, 5)
+    except Exception as e:  # noqa: BLE001
+        print(f"conflict-copy scan skipped ({e})")
     return code
 
 
@@ -378,11 +498,41 @@ def cmd_consume(a) -> int:
     return 0
 
 
+def cmd_reader(a) -> int:
+    sid = _sid()
+    if not sid:
+        print("ERROR: no CLAUDE_CODE_SESSION_ID — a reader binding needs a Claude Code session (plain terminals: set ICM_WINDOW).",
+              file=sys.stderr)
+        return 5
+    me = _me()
+    if me and not lp.is_reader(sid):
+        print(f"already bound: window={me.window} (a claimed session needs no reader identity)")
+        return 0
+    w = bind_reader(sid, a.hint)
+    print(f"READER {w} · session {sid} · no lock, no folder — edits stay denied; Stop hook passes; `lock.py claim` upgrades this binding")
+    return 0
+
+
+def cmd_who(a) -> int:
+    """Every lock with its holder resolved to a peer address (PROTOCOL §16) — read-only."""
+    import peers
+    rows = peers.who()
+    if getattr(a, "json", False):
+        import json
+        print(json.dumps({"locks": rows, "peers": peers.registry()}, indent=2, default=str))
+    else:
+        print(peers.render(rows))
+    return 0
+
+
 def cmd_whoami(a) -> int:
     me = _me()
     if me is None:
         print(f"NO IDENTITY (session {_sid() or 'unknown'}). {lp.NO_IDENTITY_HELP}")
         return 5
+    if _sid() and lp.is_reader(_sid()):
+        print(f"READER {me.window} · session {_sid()} · no lock, no folder (browsing; claim before editing)")
+        return 0
     print(f"window={me.window} source={me.source} session={_sid() or '-'}")
     return 0
 
@@ -435,6 +585,10 @@ def main() -> int:
     h = sub.add_parser("check"); h.add_argument("folder"); h.set_defaults(fn=cmd_check)
     k = sub.add_parser("consume", help="record that this session consumed a handoff it staged (target folder yours or free)")
     k.add_argument("path", help="repo-relative path of the .staged.md / .fired.md note"); k.set_defaults(fn=cmd_consume)
+    rd = sub.add_parser("reader", help="bind a READER identity (no lock, no folder) so a menu-only session's state writes have an author")
+    rd.add_argument("--hint", default="menu"); rd.set_defaults(fn=cmd_reader)
+    w = sub.add_parser("who", help="every lock -> window -> session -> holder's peer name + live/gone (§16)")
+    w.add_argument("--json", action="store_true"); w.set_defaults(fn=cmd_who)
     sub.add_parser("whoami").set_defaults(fn=cmd_whoami)
     sub.add_parser("mine").set_defaults(fn=cmd_mine)
     sub.add_parser("status").set_defaults(fn=cmd_status)

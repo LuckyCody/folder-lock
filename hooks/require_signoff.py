@@ -4,7 +4,8 @@
 .claude/settings.json (scripts/install.py --claude-hooks writes this):
   "Stop": [{"hooks": [{"type": "command", "command": "python .githooks/require_signoff.py"}]}]
 
-  identity unknown                 -> BLOCK once per prompt ("no window identity")
+  identity unknown / reader        -> pass: an unclaimed session is a BROWSING session (menu, questions); the edit
+                                      guard is what protects the tree, there is nothing to sign off (v4.2)
   no lock held / status: open      -> pass
   status: closing                  -> BLOCK: pointer missing or older than lock start
                                       ("pointer not updated"), else "LOCK.yaml still exists — release"
@@ -74,10 +75,13 @@ def main() -> int:
     except lp.IdentityConflict as e:
         return _out(False, "conflict already reported", ctx) if _already_blocked(sid, inp.get("prompt_id", "")) else _out(True, str(e), ctx)
     if me is None:
-        if _already_blocked(sid, inp.get("prompt_id", "")):
-            return _out(False, "no identity — already reported this prompt", ctx)
-        return _out(True, lp.NO_IDENTITY_HELP, ctx)
+        # a session that never claimed is a BROWSING session, not an error state: the edit guard fail-closes every
+        # guarded edit without identity, so it cannot hold unsaved guarded work, and no LOCK.yaml can be `closing`
+        # for a window that does not exist (v4.2 — the nag used to fire on every menu-only turn)
+        return _out(False, "no identity — nothing claimed this session; edit guard fail-closes, nothing to sign off", ctx)
     ctx["window"] = me.window
+    if sid and lp.is_reader(sid):
+        return _out(False, f"reader identity {me.window} — menu-only session, nothing to sign off", ctx)
     folders = [f for f in lp.read_session(sid).get("folders", [])] if sid else []
     if os.environ.get("ICM_FOLDER"):
         folders.append(os.environ["ICM_FOLDER"].strip().strip("/") or ".")

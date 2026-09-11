@@ -8,16 +8,18 @@ the pre-commit guard stays the model-agnostic last line).
 
   outside the repo                       -> allow
   identity unknown                       -> DENY  "no window identity"
+  reader identity (lock.py reader)       -> DENY  "reader identity … claim first" (a window with no folder edits nothing)
   registry present but unreadable        -> DENY  (fail closed)
   path -> unguarded folder (no .goal/)   -> DENY  "claim it (creates .goal/)"
   whitelist (.goal/**, own workflow-state/**) -> allow
-  fresh lock of another window (LOCK.yaml or .firing.lock) -> DENY, names holder/task/since
+  fresh lock of another window (LOCK.yaml or .firing.lock) -> DENY, names holder/task/since + the holder's peer address (§16)
+  a divergent sync conflict copy beside the target -> DENY until it is folded (§15)
   stale foreign lock                     -> DENY, "ask the owner" (never silently proceed)
   fresh lock of mine (open or closing)   -> allow
   no fresh lock of mine                  -> DENY  "claim first"
   ANY internal error                     -> DENY  (a guard that cannot evaluate fails closed)
 
-Output: JSON permissionDecision deny + exit 2. Every decision -> <repo>/.goal/guard_log.jsonl.
+Output: JSON permissionDecision deny + exit 2. Every decision -> <STATE_ROOT>/guard_log.jsonl (lockpath.STATE_ROOT, §14).
 """
 from __future__ import annotations
 
@@ -86,8 +88,24 @@ def main() -> int:
     if me is None:
         return _deny(lp.NO_IDENTITY_HELP + f" (path {rel} -> folder {res.folder or '<root>'})", ctx)
     ctx["window"] = me.window
+    if me.source == "session" and lp.is_reader(me.session_id):
+        return _deny(f"reader identity {me.window} (menu-only session, no lock, no folder) — claim first: "
+                     f"python scripts/lock.py claim {res.folder or '.'} --task \"...\" (path {rel})", ctx)
     if res.kind == "unguarded":
         return _deny(f"unguarded folder for {rel}: {res.detail}", ctx)
+    # §15: a divergent sync conflict copy beside the target means the disk holds two versions of this file —
+    # the edit would land on one of them blind. Fold first (python lib/conflicts.py <folder> --resolve).
+    # Checked BEFORE the whitelist: a pointer under your own lock is exactly the file a copy shadows.
+    try:
+        import conflicts
+        div = [c for c in conflicts.siblings_of(rel) if c.kind in ("divergent", "appendlog")]
+    except Exception:
+        div = []
+    if div:
+        c = div[0]
+        return _deny(f"{rel} has a divergent conflict copy beside it: {c.sibling} ({c.extra_lines} line(s) only in the copy). "
+                     f"Read the copy, fold what is true into {rel} via shell/script, delete the copy, then edit. "
+                     f"`python lib/conflicts.py {res.folder or ''} --json` lists it (PROTOCOL §15).", ctx)
     wl = lp.is_whitelisted(rel, res, me)
     if wl:
         return _allow(f"whitelist: {wl}", ctx)
@@ -110,7 +128,14 @@ def main() -> int:
             continue
         if li.fresh:
             who = "a headless agent" if li.kind == "fired" else "another session"
-            return _deny(f"{rel} is inside folder '{res.folder or '<root>'}' held by {who}: {li.describe()}. Stage a handoff "
+            peer = ""
+            if li.kind == "interactive":
+                try:
+                    import peers
+                    peer = f" Holder: {peers.label(peers.holder(li.window))} — message them first (PROTOCOL §16)."
+                except Exception:
+                    pass
+            return _deny(f"{rel} is inside folder '{res.folder or '<root>'}' held by {who}: {li.describe()}.{peer} Stage a handoff "
                          f"instead (python scripts/handoff.py --to {res.folder or '.'} --task \"...\"). If that lock is YOURS from "
                          f"before the guards: python scripts/lock.py adopt {res.folder or '.'}", ctx)
     if mine_fresh is not None:

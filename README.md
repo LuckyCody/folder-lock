@@ -1,5 +1,7 @@
 # folder-lock — many agents, one repo, no conflicting saves
 
+**v4.2.0** — runtime state leaves the working tree: a host-local state root (`%LOCALAPPDATA%\folder-lock\<repo-hash>`) for bindings, guard logs and self-test records, and `lib/statestore.py` for the coordination documents (items, inbox index, digest window) with conditional ETag writes, per-record merge on a lost race, cache + outbox when offline — file backend by default, Azure Blob optional. Plus three proofs before trusting the disk (sync conflict copies gate the claim, rules-set bytes are compared across hosts, a PostToolUse hook proves a pointer was read in full), a lock-holder view (`lock.py who` names the peer to message), a reader identity for menu-only sessions, `board.py menu` as the §13 exit gate, conflict test 21/21. See [What's new in v4.2](#whats-new-in-v42).
+
 **v4.1.0** — the handoff ledger moves to an append-only sidecar (the binding YAML is identity only), `lock.py consume` records a handoff you staged and then did yourself, literal locks survive a registry remap ("the closest existing lock wins"), consumed placeholder notes leave the board, conflict test 14/14. See [What's new in v4.1](#whats-new-in-v41).
 
 **v4.0.0** — the board becomes a work queue: every item has `ready | in_progress | waiting_owner | done`, a decision-ready `question` when it waits on the owner, `created_by`/`owner` routing by path, a dedup rule, a per-folder autorun log, and `scripts/autorun.py` — a loop that fires one fresh agent per ready item until nothing is left that an agent may do. The owner sees the board only then. See [What's new in v4](#whats-new-in-v4). (v3: per-module locks + the deploy queue, [below](#whats-new-in-v3).)
@@ -32,18 +34,20 @@ Expected tail:
   PASS  holder (case-insensitive) passes
   PASS  unguarded folder (no .goal/) is refused
   PASS  broken hooksPath is detected loudly by --verify-wiring
-[lock-guard] self-test PASS: 6/6
+  PASS  state store round-trip: stale-etag writer merges, both records present (§14)
+[lock-guard] self-test PASS: 7/7
 
 INSTALLED and PROVEN. Repeat in every clone/worktree.
 ```
 
-Then prove the whole ladder: `bash .claude/skills/folder-lock/tests/conflict_run.sh` — 12 scenarios (plus `python scripts/deploy_selftest.py` for the deploy queue), each ending in a visible refusal (or a visible pass where a pass is the point), with hook stdin/stdout printed for the edit, Stop and no-identity cases.
+Then prove the whole ladder: `bash .claude/skills/folder-lock/tests/conflict_run.sh` — 21 scenarios (plus `python scripts/deploy_selftest.py` for the deploy queue and `python tests/autorun_run.py` for the loop), each ending in a visible refusal (or a visible pass where a pass is the point), with hook stdin/stdout printed for the edit, Stop and no-identity cases. Every fixture uses its own throwaway state root — the live store is never touched.
 
 ## Daily shape
 
 ```bash
-python scripts/board.py                                    # what's in flight (locks show status: closing = signing off)
-python scripts/lock.py claim finance/payroll --task "August close" --hint payroll
+python scripts/board.py menu                               # the owner's gate: ready>0 -> digest + waiting + locks; ready==0 -> full board
+python scripts/lock.py who                                 # every lock -> holder's peer name + live/GONE — who to message (§16)
+python scripts/lock.py claim finance/payroll --task "August close" --hint payroll   # folds/gates sync conflict copies, prints the pointer proof + rules line (§15)
 # ... edit only inside finance/payroll — the edit guard denies anything else ...
 python scripts/handoff.py --to finance/datev --task "re-export EXTF after close"
 git add <your paths> && git commit -m "..."                # identity comes from the session binding
@@ -62,7 +66,9 @@ Inside Claude Code no env var is needed: `claim` binds the minted window to `CLA
 | `require_lock.py` (PreToolUse) | editing without a lock, under someone else's lock, in a folder with no `.goal/` — before files tangle |
 | `check_locks.py` (pre-commit) | staged paths under another window's lock, unclaimed/unguarded folders, `git add -A` sweeps, missing identity, a hook that is not actually wired |
 | `protect_main.py` (pre-commit) | plain commits on `main`/`master` |
-| `require_signoff.py` (Stop) | ending a turn holding a `closing` lock with the pointer stale or the lock not released; ending with no identity |
+| `require_signoff.py` (Stop) | ending a turn holding a `closing` lock with the pointer stale or the lock not released (a session with no identity is browsing and passes) |
+| `check_pointer_read.py` (PostToolUse on Read) | a sliced read of a pointer / inbox note / rules file presented as complete — injects `READ IN FULL ✓` or `PARTIAL READ ⚠` + the action line verbatim |
+| `lock.py claim` gate (§15) | divergent sync conflict copies of load-bearing files (refuses, exit 5), rules-byte drift across hosts (reported) |
 
 Escape hatches, all deliberate and loud: `ICM_WINDOW=<w>` (you are the holder), `MAIN_COMMIT_OK=1` (solo commit on main), `ICM_LOCK_BYPASS=1` (owner-approved only), `git config folderlock.protected "main,release"`.
 
@@ -77,6 +83,18 @@ workflows:
   - finance/payroll/**
   - .claude/skills/payroll/**        # locks at finance/payroll/.goal — one lock per workflow home
 ```
+
+## What's new in v4.2
+
+One tree shared by two hosts through a sync tool, several sessions each, plus headless agents — and the runtime state was riding the same sync. This release moves it out and adds the proofs that a synced disk needs.
+
+- **State root** (`lib/lockpath.py`): `STATE_ROOT` = `FOLDER_LOCK_STATE_ROOT` or `%LOCALAPPDATA%\folder-lock\<repo-hash>` (`~/.local/state/…` elsewhere). Session bindings + handoff sidecars, `guard_log.jsonl`, `selftest_last.json`, the conflict-suite record and the signpost copy live there. Bindings still at `.goal/sessions/` are copied over lazily. Locks, inbox notes, `workflow-state/` and the deploy queue stay in the tree on purpose (PROTOCOL §14.4).
+- **`lib/statestore.py`**: documents `items`, `inboxes`, `last_seen`, `rules_hash` with ETag-conditional writes, three-way per-record merge on a lost race, cache + outbox when offline, `READONLY` for renders. File backend by default; `FOLDER_LOCK_STATE_BACKEND=blob` + `FOLDER_LOCK_STATE_ACCOUNT` for Azure Blob. `lib/items.py`, `lib/autorun_log.py`, `scripts/handoff.py`, `lock.py release` go through it; `statestore.py status|get|replay|migrate [--purge]`.
+- **Three proofs (§15)**: `lib/conflicts.py` — sync conflict copies (`-HOSTNAME`, ` - Copy`, ` (N)`, `.sync-conflict-…`) classified and folded by `lock.py claim`; a divergent copy of a load-bearing file refuses the claim (exit 5) or, inside your folder, becomes the claim's first act; `require_lock` denies an edit beside one. `lib/rules_hash.py` — the rules set hashed per host, published to the store, `RULES DIVERGE ⚠` names the file (reports, never blocks). `hooks/check_pointer_read.py` — PostToolUse on Read: `READ IN FULL ✓` / `PARTIAL READ ⚠ … Next concrete action (verbatim, L…)`; `install.py --claude-hooks` wires it.
+- **Lock-holder view (§16)**: `lib/peers.py` + `lock.py who` join `LOCK.yaml` → binding → Claude Code's `~/.claude/sessions/<pid>.json` into the holder's `ListAgents` name with live / GONE / exited / headless. `lock.py check` and the edit guard print `Holder: … — message them first`; GONE = orphaned lock → ask the owner.
+- **Reader identity**: `lock.py reader` binds a window with no lock and no folder so a menu-only session's state writes have an author; edits stay denied, the Stop hook passes, `claim` upgrades it. The Stop hook no longer nags a session that never claimed anything (browsing is not an error state).
+- **`board.py menu`**: the §13 exit gate — `ready > 0` → digest · waiting-on-owner · locks (with holders) · deploys · one ▸ line (kicks `scripts/autorun.py --detach` when `FOLDER_LOCK_RUNNER` is set); `ready == 0` → the full board. `json` gains `locks`, `items`, `digest`. Renders never write; `--signpost` alone rewrites the tracked `.folder-lock/next-session.md`.
+- **Tests**: `check_locks.py --self-test` 7/7 (+ store round-trip); `tests/conflict_run.sh` scenarios 15 (write race merges), 16 (offline → outbox → replay), 17 (conflict copies), 18 (rules hash), 19 (read coverage), 20 (holder view), 21 (reader) — 21/21; `tests/autorun_run.py` on a throwaway state root.
 
 ## What's new in v4.1
 

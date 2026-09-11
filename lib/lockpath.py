@@ -18,13 +18,26 @@ Resolution for a repo-relative path:
 
 Identity:
   a) ICM_WINDOW env var (plain terminals, headless agents launched with it set)
-  b) session binding `<repo>/.goal/sessions/<session_id>.yaml` written by
+  b) session binding `<STATE_ROOT>/sessions/<session_id>.yaml` written by
      `scripts/lock.py claim|adopt`; session_id = hook stdin `session_id`, or in
      Bash-run scripts Claude Code's CLAUDE_CODE_SESSION_ID env var.
   Both present and different -> IdentityConflict. Neither -> None (guards refuse).
   The binding YAML is identity only. Handoff records (`staged <path>` / `consumed <path>`)
   live in the append-only sidecar `<session_id>.handoffs.txt` next to it (v4.1) — the YAML
   is rewritten on every claim/release and must never carry a ledger.
+  A binding with `kind: reader` and no folders (v4.2, `lock.py reader`) is an identity WITHOUT a
+  lock domain: a menu-only session's state writes carry an author, but it may not edit anything.
+
+Two roots (v4.2, PROTOCOL §14):
+  ROOT        the working tree. Locks (`.goal/LOCK.yaml`, `.firing.lock`), inbox notes,
+              `workflow-state/` and the deploy queue (`.goal/deploy/`) stay here on purpose —
+              the edit guard must work offline and fail closed.
+  STATE_ROOT  host-local runtime state that must NOT ride a file-sync tool: session bindings
+              + handoff sidecars (`sessions/`), `guard_log.jsonl`, `selftest_last.json`, the
+              state-store cache/outbox/file backend (`lib/statestore.py`), the signpost copy.
+              `FOLDER_LOCK_STATE_ROOT`, else `%LOCALAPPDATA%\\folder-lock\\<repo-hash>` (Windows) /
+              `$XDG_STATE_HOME|~/.local/state/folder-lock/<repo-hash>`. A binding still sitting at the
+              pre-4.2 tree location `<repo>/.goal/sessions/` is copied over lazily on first use.
 
 Literal locks (v4.1): a folder claimed as its own lock domain and later folded into another
   home by a registry edit keeps its `LOCK.yaml`. `literal_lock()` finds the closest fresh
@@ -38,8 +51,11 @@ Freshness: LOCK.yaml stale after 24h (by `started:`), .firing.lock stale after 1
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import os
 import re
+import shutil
+import socket
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -70,10 +86,41 @@ def _detect_root() -> Path:
 
 ROOT = _detect_root()
 ROOT_LOCK_DIR = ROOT / ".goal"
-STATE = ROOT / ".goal"                       # runtime state, gitignored via **/.goal/
-SESSIONS = STATE / "sessions"
+STATE = ROOT / ".goal"                       # tree-side runtime carrier (locks, inbox, deploy queue) — gitignored via **/.goal/
+LEGACY_SESSIONS = STATE / "sessions"         # pre-4.2 binding location: read-only fallback + lazy copy
+LEGACY_INBOX_INDEX = STATE / "inboxes.txt"   # pre-4.2 inbox index: migrated into the state store (lib/statestore.py)
 REGISTRY = ROOT / ".folder-lock" / "registry.yaml"
-INBOX_INDEX = STATE / "inboxes.txt"
+
+
+def repo_hash() -> str:
+    """Stable 12-hex id of this working tree (case-folded, forward slashes) — keys the host-local state root."""
+    return hashlib.sha1(str(ROOT).replace("\\", "/").lower().encode("utf-8")).hexdigest()[:12]
+
+
+def _detect_state_root() -> Path:
+    env = os.environ.get("FOLDER_LOCK_STATE_ROOT")
+    if env:
+        return Path(env)
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_STATE_HOME")
+    root = Path(base) if base else Path.home() / ".local" / "state"
+    return root / "folder-lock" / repo_hash()
+
+
+STATE_ROOT = _detect_state_root()
+SESSIONS = STATE_ROOT / "sessions"
+
+
+def _host() -> str:
+    h = os.environ.get("FOLDER_LOCK_HOST") or os.environ.get("COMPUTERNAME") or ""
+    if not h:
+        try:
+            h = socket.gethostname()
+        except Exception:
+            h = ""
+    return (h or "host").upper()
+
+
+HOST = _host()
 
 LOCK_FRESH = timedelta(hours=24)
 FIRING_FRESH = timedelta(minutes=15)
@@ -331,12 +378,31 @@ class Identity:
     session_id: str = ""
 
 
+def _safe_sid(session_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:80]
+
+
 def session_file(session_id: str) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:80]
-    return SESSIONS / f"{safe}.yaml"
+    return SESSIONS / f"{_safe_sid(session_id)}.yaml"
+
+
+def _ensure_migrated(session_id: str) -> None:
+    """A binding (and its sidecar) that still sits at the pre-4.2 tree location is copied to STATE_ROOT
+    once, so a host bound before the move keeps every identity with no manual step (PROTOCOL §14)."""
+    if not session_id or not LEGACY_SESSIONS.is_dir():
+        return
+    try:
+        for name in (f"{_safe_sid(session_id)}.yaml", f"{_safe_sid(session_id)}.handoffs.txt"):
+            old, new = LEGACY_SESSIONS / name, SESSIONS / name
+            if old.is_file() and not new.exists():
+                SESSIONS.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(old, new)
+    except OSError:
+        pass
 
 
 def read_session(session_id: str) -> dict:
+    _ensure_migrated(session_id)
     try:
         text = session_file(session_id).read_text(encoding="utf-8")
     except OSError:
@@ -351,6 +417,7 @@ _LEGACY_HANDOFF = re.compile(r'^(handoff|consumed):\s*"?(.+?)"?\s*$', re.M)
 
 def handoffs_file(session_id: str) -> Path:
     """Append-only sidecar next to the binding: one record per line, `staged <path>` / `consumed <path>`."""
+    _ensure_migrated(session_id)
     return session_file(session_id).with_suffix(".handoffs.txt")
 
 
@@ -390,6 +457,7 @@ def read_handoffs(session_id: str) -> list:
 
 
 def write_session(session_id: str, window: str, folders: list, extra: Optional[dict] = None) -> Path:
+    _ensure_migrated(session_id)
     SESSIONS.mkdir(parents=True, exist_ok=True)
     p = session_file(session_id)
     # legacy bindings carried `handoff:` / `consumed:` lines inline; move them to the sidecar once,
@@ -414,6 +482,13 @@ def write_session(session_id: str, window: str, folders: list, extra: Optional[d
     return p
 
 
+def is_reader(session_id: str) -> bool:
+    """A binding with `kind: reader` and no folders — identity without a lock domain (v4.2, PROTOCOL §1b):
+    a menu-only session's state writes carry an author, but it may not edit anything."""
+    cur = read_session(session_id) if session_id else {}
+    return bool(cur.get("window")) and str(cur.get("kind", "")).strip().strip('"') == "reader" and not cur.get("folders")
+
+
 def identity(session_id: str = "", env: Optional[dict] = None) -> Optional[Identity]:
     env = os.environ if env is None else env
     env_window = (env.get("ICM_WINDOW") or "").strip()
@@ -422,7 +497,7 @@ def identity(session_id: str = "", env: Optional[dict] = None) -> Optional[Ident
     if env_window and sess_window and not same_window(env_window, sess_window):
         raise IdentityConflict(
             f"ICM_WINDOW={env_window!r} but this session is bound to window {sess_window!r} "
-            f"(.goal/sessions). Unset one; never commit under a borrowed identity.")
+            f"({SESSIONS}). Unset one; never commit under a borrowed identity.")
     if env_window:
         return Identity(env_window, "env", sid)
     if sess_window:
@@ -491,9 +566,10 @@ def is_whitelisted(rel: str, res: Resolution, me: Optional[Identity]) -> str:
 
 
 def guard_log(event: dict) -> None:
+    """Append one decision to <STATE_ROOT>/guard_log.jsonl (host-local, §14 — never in the tree)."""
     try:
         import json
-        p = STATE / "guard_log.jsonl"
+        p = STATE_ROOT / "guard_log.jsonl"
         p.parent.mkdir(parents=True, exist_ok=True)
         event.setdefault("ts", datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
         with p.open("a", encoding="utf-8") as fh:

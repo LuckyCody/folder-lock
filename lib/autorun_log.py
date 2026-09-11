@@ -22,7 +22,6 @@ import mint  # noqa: E402
 import lockpath as lp  # noqa: E402
 
 ROOT = lp.ROOT
-SEEN = lp.STATE / "autorun_last_seen.txt"
 SKIP = {".git", "node_modules", ".venv", "venv", "__pycache__", ".next", "dist", "build", ".githooks"}
 LINE = re.compile(r"^- (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}) · (.+?) · (.+?) · (\w+) · (\S+) · by (\S+) · decisions: (.*)$")
 
@@ -54,15 +53,14 @@ def digest(since: str = "") -> list:
 
 
 def last_seen() -> str:
-    try:
-        return SEEN.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
+    """The owner's digest window: state-store document `last_seen` (PROTOCOL §14) — was <repo>/.goal/autorun_last_seen.txt."""
+    import statestore
+    return str(statestore.load("last_seen", {"ts": ""}).get("ts", "")).strip()
 
 
 def mark_seen() -> None:
-    SEEN.parent.mkdir(parents=True, exist_ok=True)
-    SEEN.write_text(mint.timestamp(), encoding="utf-8")
+    import statestore
+    statestore.save("last_seen", {"ts": mint.timestamp()})
 
 
 def _cli(argv: list[str]) -> int:

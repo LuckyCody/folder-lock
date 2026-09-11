@@ -9,13 +9,18 @@ as the runner and asserts statuses, the question, created_by, one autorun-log li
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# §14: the acceptance run uses a THROWAWAY state root (items, inbox index, seen stamp, bindings) — never the live one.
+# Set before lockpath is imported so the in-process items.load() and every subprocess agree on it.
+os.environ.setdefault("FOLDER_LOCK_STATE_ROOT", tempfile.mkdtemp(prefix="folderlock-autorun-state-"))
 sys.path.insert(0, str(HERE.parent / "lib"))
 import lockpath as lp  # noqa: E402
 import items  # noqa: E402
@@ -24,7 +29,7 @@ ROOT = lp.ROOT
 ALPHA, BETA = "_autorun-test-alpha", "_autorun-test-beta"
 PY = sys.executable
 # fixture handoffs must not land on the running session's binding (they are deleted with the fixture)
-TEST_ENV = {k: v for k, v in __import__('os').environ.items() if k != 'CLAUDE_CODE_SESSION_ID'}
+TEST_ENV = {k: v for k, v in os.environ.items() if k != 'CLAUDE_CODE_SESSION_ID'}
 STUB = f'"{PY}" "{HERE / "autorun_stub_agent.py"}"'
 
 

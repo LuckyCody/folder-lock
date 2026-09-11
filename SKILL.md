@@ -15,15 +15,16 @@ Read `PROTOCOL.md` once; it is one page and it is the contract. This file tells 
 
 1. Resolve the folder **by the path you are about to touch**: `.folder-lock/registry.yaml` `owns:` globs if the repo has one, nearest folder with a front door otherwise. Inside a multi-module app the lock is the MODULE folder (or `core/` for wiring) — never "the whole app" (PROTOCOL §1, `templates/registry.yaml`).
 2. `python <skill>/scripts/lock.py check <folder>`
-   - `LOCKED` (fresh, not yours) → **stop**. Say who/what/since when. Offer a handoff.
+   - `LOCKED` (fresh, not yours) → **stop editing there**, but do not park the work: the report names the holder's peer address (`Holder: <name> · live`) — **message them first** ("release ETA, or hand it over?", PROTOCOL §16). Stage a handoff only when the holder is unreachable (unbound here / headless) or says "not soon". `Holder: … GONE` = orphaned lock → ask the owner (§1). `python <skill>/scripts/lock.py who` lists every lock with its holder.
+   - exit 5 `CONFLICT COPY` → a divergent sync conflict copy of a load-bearing file sits outside this folder (PROTOCOL §15). Claim the folder that owns the canonical and fold it there; never read the copy as the rule.
    - `SIGNING OFF` (fresh, `status: closing`) → the holder is mid-signoff, not stale. Never offer takeover.
    - `STALE` → say so, ask. Never silently proceed (`--force-stale` only after the owner agreed).
    - `AGENT HOLDS` → a headless run is live there. Wait or stage a handoff.
    - `FREE` → `python <skill>/scripts/lock.py claim <folder> --task "<one line>" --stream "<id>" --hint <word>` — mints the window ID, writes `status: open`, binds the ID to this Claude session (that binding IS your identity for the edit guard, the pre-commit guard and the Stop hook; no env var needed). Suggest the owner rename the terminal to the minted ID.
-3. Read `<folder>/workflow-state/current-pointer.md` and `<folder>/.goal/inbox/*.staged.md`. Start at `Next concrete action:`.
+3. Read `<folder>/workflow-state/current-pointer.md` and `<folder>/.goal/inbox/*.staged.md` **in full** — the claim printed the pointer's size, sha256 and its action line; the PostToolUse hook answers every Read with `READ IN FULL ✓` or `PARTIAL READ ⚠` (PROTOCOL §15). Never report a file's state after a ⚠ line. Start at `Next concrete action:`. If the claim printed `FIRST ACT … fold:`, fold that conflict copy before anything else.
 4. A pre-guard hand-written lock that is yours: `python <skill>/scripts/lock.py adopt <folder>`.
 
-Fresh window, nothing claimed: `python <skill>/scripts/board.py` first, then claim or drop.
+Fresh window, nothing claimed: `python <skill>/scripts/board.py menu` first (it is the §13 gate: with ready items it shows the digest, what waits on the owner and who holds what; with none, the full board), then claim or drop. A menu-only session is a browsing session — the Stop hook lets it end; it gets a reader identity, never a lock.
 
 ## While working
 
@@ -61,7 +62,7 @@ Do not render the owner's menu and do not start another item in this session: th
 python <skill>/scripts/install.py [<repo>] --claude-hooks
 ```
 
-Copies `hooks/*` + `lib/*` to `<repo>/.githooks/`, sets `core.hooksPath`, gitignores `**/.goal/`, merges the PreToolUse + Stop hooks into `.claude/settings.json` (omit the flag to just print the JSON), then **runs `check_locks.py --self-test`**. Install is not done until it says PASS. Re-run in every clone and worktree. When the owner asks "does the hook actually work": `python <skill>/scripts/selftest.py` and `bash <skill>/tests/conflict_run.sh` (12 scenarios, real refusals, hook stdin/stdout for 1, 6, 9) — paste the result, never answer from the fact that the file exists.
+Copies `hooks/*` + `lib/*` to `<repo>/.githooks/`, sets `core.hooksPath`, gitignores `**/.goal/`, merges the PreToolUse + Stop + PostToolUse(Read) hooks into `.claude/settings.json` (omit the flag to just print the JSON), then **runs `check_locks.py --self-test`** (7 cases). Install is not done until it says PASS. Re-run in every clone and worktree. Runtime state (bindings, guard log, the state store) lives in `%LOCALAPPDATA%\folder-lock\<repo-hash>` or `FOLDER_LOCK_STATE_ROOT` — never in the tree (PROTOCOL §14); a repo upgraded from ≤4.1 runs `python <skill>/lib/statestore.py migrate --purge` once. When the owner asks "does the hook actually work": `python <skill>/scripts/selftest.py` and `bash <skill>/tests/conflict_run.sh` (21 scenarios, real refusals, hook stdin/stdout for 1, 6, 9) — paste the result, never answer from the fact that the file exists.
 
 ## Behaviours this skill forbids
 
@@ -80,21 +81,27 @@ SKILL.md                     what to do at each moment (this file)
 PROTOCOL.md                  the one-page contract — cite it, never paraphrase it
 lib/lockpath.py              ONE resolver + lock reader + identity, imported by every guard
 lib/mint.py                  every identifier: window, agent, handoff, drop, timestamp
+lib/statestore.py            coordination documents (items, inboxes, last_seen, rules_hash): ETag writes, merge, cache/outbox; file | blob
+lib/conflicts.py             sync conflict copies: classify, fold the harmless, gate the claim / the edit on a divergent one (§15)
+lib/rules_hash.py            rules-set bytes per host -> store; RULES DIVERGE names the file (§15, reports only)
+lib/peers.py                 lock -> window -> session -> holder's peer name + liveness (§16)
+hooks/check_pointer_read.py  PostToolUse on Read: READ IN FULL / PARTIAL READ + the pointer's action line verbatim (§15)
 hooks/pre-commit             shim: check_locks + protect_main; no python = no commit
 hooks/check_locks.py         commit guard, fail closed; --self-test, --verify-wiring
 hooks/protect_main.py        refuse plain commits on main/master (MAIN_COMMIT_OK=1)
 hooks/require_lock.py        PreToolUse edit guard (Edit/Write/MultiEdit/NotebookEdit)
 hooks/require_signoff.py     Stop hook: no ending a turn with a closing lock
 lib/deployunits.py           deploy units (.folder-lock/deploy-units.yaml): path -> unit, dirty check, test markers
-scripts/lock.py              claim | adopt | close | reopen | release | check | whoami | mine | status
+scripts/lock.py              claim | adopt | close | reopen | release | check | consume | reader | who | whoami | mine | status
 scripts/handoff.py           stage | fire a task into another folder's .goal inbox (minted names)
-scripts/board.py             one screen: locks (with status), pointers (typed), staged handoffs, deploy queue
+scripts/board.py             menu (the §13 gate) | json | bare full board | --signpost; renders never write
 scripts/deploy_request.py    drop a deploy request (--for <folder> | --unit | --changed) — never deploys
 scripts/deployer.py          THE deployer: collapse pending requests -> one deploy of HEAD -> results into workflow-state
 scripts/test_unit.py         run a unit's tests, leave the per-window marker the commit guard looks for
 scripts/deploy_selftest.py   prove the queue: collapse, already-deployed, failure+back-off, dirty-tree block, guard warning
 scripts/install.py           copy hooks+lib, hooksPath, .gitignore, --claude-hooks, self-test
 scripts/selftest.py          commit-guard self-test + protected-branch cases
-tests/conflict_run.sh        12-scenario proof of which guardrail is active where
+tests/conflict_run.sh        21-scenario proof of which guardrail is active where (own throwaway state root)
+tests/autorun_run.py         seeded acceptance run of the loop (own throwaway state root)
 templates/                   LOCK.yaml, current-pointer.md, registry.yaml (per-module + core), deploy-units.yaml
 ```

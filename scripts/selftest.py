@@ -38,6 +38,7 @@ def main() -> int:
             shutil.copy2(f, repo / ".githooks" / "lib" / f.name)
         env = {k: v for k, v in os.environ.items() if k not in ("ICM_WINDOW", "ICM_LOCK_BYPASS", "CLAUDE_CODE_SESSION_ID", "MAIN_COMMIT_OK")}
         env["FOLDER_LOCK_ROOT"] = str(repo)
+        env["FOLDER_LOCK_STATE_ROOT"] = str(tmp / "state")   # never the live state root
 
         def run(*args, **kw):
             e = dict(env); e.update(kw.pop("env", {}))

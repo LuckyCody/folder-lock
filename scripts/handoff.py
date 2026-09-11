@@ -51,13 +51,9 @@ def is_parked(target: Path) -> bool:
 
 
 def _register_inbox(target_rel: str) -> None:
-    lp.INBOX_INDEX.parent.mkdir(parents=True, exist_ok=True)
-    lines = []
-    if lp.INBOX_INDEX.exists():
-        lines = [l.strip() for l in lp.INBOX_INDEX.read_text(encoding="utf-8").splitlines() if l.strip()]
-    if target_rel not in lines:
-        lines.append(target_rel)
-        lp.INBOX_INDEX.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    """Inbox index = state-store document `inboxes` (PROTOCOL §14) — was <repo>/.goal/inboxes.txt."""
+    import statestore
+    statestore.register_inbox(target_rel)
 
 
 def main() -> int:

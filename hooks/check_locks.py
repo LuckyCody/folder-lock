@@ -11,10 +11,10 @@ WARNS (never refuses) when a staged path lies inside a deploy unit (.folder-lock
 session has no fresh PASS marker from `scripts/test_unit.py <unit>` (PROTOCOL §11, best effort).
 
 Identity: ICM_WINDOW env, or the session binding via CLAUDE_CODE_SESSION_ID (Claude Code sets it
-in the Bash tool env) -> <repo>/.goal/sessions/<sid>.yaml. Override: ICM_LOCK_BYPASS=1 (say so).
+in the Bash tool env) -> <STATE_ROOT>/sessions/<sid>.yaml (lockpath.STATE_ROOT, §14). Override: ICM_LOCK_BYPASS=1 (say so).
 
   python .githooks/check_locks.py --verify-wiring
-  python .githooks/check_locks.py --self-test [--if-changed]     records <repo>/.goal/selftest_last.json
+  python .githooks/check_locks.py --self-test [--if-changed]     records <STATE_ROOT>/selftest_last.json (7 cases incl. the §14 store round-trip)
 """
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ def verify_wiring(repo: Path) -> str:
 
 def fingerprint(repo: Path) -> str:
     h = hashlib.sha256()
-    for p in (HERE / "check_locks.py", HERE / "pre-commit", LIB / "lockpath.py", lp.REGISTRY):
+    for p in (HERE / "check_locks.py", HERE / "pre-commit", LIB / "lockpath.py", LIB / "statestore.py", LIB / "conflicts.py", lp.REGISTRY):
         try:
             h.update(p.read_bytes())
         except OSError:
@@ -178,7 +178,7 @@ def guard(repo: Path) -> int:
 def self_test(repo: Path, if_changed: bool) -> int:
     import shutil
     import tempfile
-    rec = lp.STATE / "selftest_last.json"
+    rec = lp.STATE_ROOT / "selftest_last.json"   # §14: host-local, never in the tree
     fp = fingerprint(repo)
     if if_changed and rec.is_file():
         try:
@@ -209,6 +209,7 @@ def self_test(repo: Path, if_changed: bool) -> int:
         (fx / ".folder-lock" / "registry.yaml").write_text("workflows:\n- id: fixture-flow\n  owns:\n  - fixture/**\n", encoding="utf-8")
         env = {k: v for k, v in os.environ.items() if k not in ("ICM_WINDOW", "ICM_LOCK_BYPASS", "CLAUDE_CODE_SESSION_ID", "MAIN_COMMIT_OK")}
         env["FOLDER_LOCK_ROOT"] = str(fx)
+        env["FOLDER_LOCK_STATE_ROOT"] = str(tmp / "state")   # never the live state root
 
         def run(*args, **kw):
             e = dict(env); e.update(kw.pop("env", {}))
@@ -233,6 +234,18 @@ def self_test(repo: Path, if_changed: bool) -> int:
         run("git", "config", "core.hooksPath", str(tmp / "elsewhere"))
         r = run(sys.executable, str(fx / ".githooks" / "check_locks.py"), "--verify-wiring"); o = r.stdout + r.stderr
         case("broken hooksPath is detected loudly by --verify-wiring", r.returncode != 0 and "NOT running" in o, o)
+        # PROTOCOL §14 store round-trip: writer 1 saves; writer 2 saves with a stale (create-only) etag -> merge, not overwrite
+        probe = ("import sys, json; sys.path.insert(0, sys.argv[1]); import statestore as s\n"
+                 "d = s.load('items', {'items': {}}); d['items']['x'] = {'title': 'x', 'updated': '2026-01-01T00:00'}; ok1 = s.save('items', d)\n"
+                 "s._base.clear(); stale = {'items': {'y': {'title': 'y', 'updated': '2026-01-01T00:01'}}}; ok2 = s.save('items', stale)\n"
+                 "back = s.load('items', {'items': {}})['items']; print(json.dumps({'ok1': ok1, 'ok2': ok2, 'keys': sorted(back)}))\n")
+        r = run(sys.executable, "-c", probe, str(fx / ".githooks" / "lib")); o = r.stdout + r.stderr
+        try:
+            j = json.loads((r.stdout or "").strip().splitlines()[-1])
+        except Exception:
+            j = {}
+        case("state store round-trip: stale-etag writer merges, both records present (§14)",
+             j.get("ok1") is True and j.get("ok2") is True and j.get("keys") == ["x", "y"], o)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     ok = all(r[1] for r in results)
