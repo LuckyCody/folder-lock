@@ -85,8 +85,21 @@ def _detect_root() -> Path:
 
 
 ROOT = _detect_root()
-ROOT_LOCK_DIR = ROOT / ".goal"
-STATE = ROOT / ".goal"                       # tree-side runtime carrier (locks, inbox, deploy queue) — gitignored via **/.goal/
+# The LOCK TREE (v4.3): where `.goal/` (locks, .firing.lock, inbox notes, deploy queue) lives. Code may run from a git
+# worktree whose gitignored `.goal/` dirs do not exist (a headless agent on its own branch) — FOLDER_LOCK_LOCK_TREE points
+# such a process at the canonical checkout so every guard still sees ONE set of locks. Default: the code root itself.
+LOCK_TREE = Path(os.environ["FOLDER_LOCK_LOCK_TREE"]).resolve() if os.environ.get("FOLDER_LOCK_LOCK_TREE") else ROOT
+ROOT_LOCK_DIR = LOCK_TREE / ".goal"
+STATE = LOCK_TREE / ".goal"                  # tree-side runtime carrier (locks, inbox, deploy queue) — gitignored via **/.goal/
+
+
+def lock_rel(p) -> str:
+    """Lock-tree-relative POSIX path for messages — a lock path is never relative to a worktree root
+    (`.relative_to(ROOT)` raised ValueError from a worktree and crashed the very release that would have ended it; v4.3)."""
+    try:
+        return Path(p).resolve().relative_to(LOCK_TREE).as_posix()
+    except ValueError:
+        return Path(p).as_posix()
 LEGACY_SESSIONS = STATE / "sessions"         # pre-4.2 binding location: read-only fallback + lazy copy
 LEGACY_INBOX_INDEX = STATE / "inboxes.txt"   # pre-4.2 inbox index: migrated into the state store (lib/statestore.py)
 REGISTRY = ROOT / ".folder-lock" / "registry.yaml"
@@ -203,7 +216,9 @@ def load_registry() -> list:
 
 def _glob_match(rel: str, glob: str) -> bool:
     g = glob.replace("\\", "/")
-    if g.endswith("/**"):
+    if g.endswith("/**") and "**" not in g[:-3]:
+        # fast path for the plain `<dir>/**` form only — `**/x/**` must reach the regex branch (v4.3: the literal
+        # base `**/x` never matched, so `owns:` globs of that shape were inert)
         base = g[:-3]
         return rel == base or rel.startswith(base + "/")
     if "**" in g:
@@ -212,14 +227,23 @@ def _glob_match(rel: str, glob: str) -> bool:
     return fnmatch.fnmatchcase(rel, g)
 
 
+def _glob_score(g: str) -> tuple:
+    """(fixed-prefix length, 1 for an exact-file glob) — an exact-file `owns:` entry beats `<dir>/**` over the same
+    directory (v4.3: two workflows scored the same prefix and the first in the file won the tie, so a core module's
+    `server.py` resolved to the surrounding dashboard workflow). Folder vs folder is unchanged: longest fixed prefix
+    wins, first in the file at a tie."""
+    g = g.replace("\\", "/")
+    return (len(_fixed_prefix(g)), 0 if any(ch in g for ch in "*?[") else 1)
+
+
 def workflow_for(rel: str, flows: list) -> Optional[Workflow]:
-    best, best_len = None, -1
+    best, best_score = None, (-1, -1)
     for w in flows:
         for g in w.globs:
             if _glob_match(rel, g):
-                n = len(_fixed_prefix(g))
-                if n > best_len:
-                    best, best_len = w, n
+                sc = _glob_score(g)
+                if sc > best_score:
+                    best, best_score = w, sc
     return best
 
 
@@ -260,13 +284,13 @@ def resolve(rel: str, flows: Optional[list] = None) -> Resolution:
         flows = load_registry()
     w = workflow_for(rel, flows)
     if w is not None and w.home:
-        return Resolution("registry", w.home, ROOT / w.home / ".goal", w.id)
+        return Resolution("registry", w.home, LOCK_TREE / w.home / ".goal", w.id)
     if len(parts) == 1 or parts[0] in ROOT_SPANNING_PREFIXES or (w is not None and w.home is None):
         return Resolution("root", "", ROOT_LOCK_DIR, None, "top-level / repo-spanning file -> root lock")
     for i in range(len(parts) - 1, 0, -1):
         folder = "/".join(parts[:i])
-        if (ROOT / folder / ".goal").is_dir():
-            return Resolution("nearest", folder, ROOT / folder / ".goal", None, "nearest folder with .goal/")
+        if (LOCK_TREE / folder / ".goal").is_dir():
+            return Resolution("nearest", folder, LOCK_TREE / folder / ".goal", None, "nearest folder with .goal/")
     guess = "/".join(parts[:min(len(parts) - 1, 3)])
     return Resolution("unguarded", guess, None, None,
                       f"'{guess}' is not in the registry and has no .goal/ — claiming creates it: "
@@ -529,7 +553,7 @@ def literal_lock(rel: str, res: Optional[Resolution] = None, now: Optional[datet
     home = (res.folder or "").strip("/") if res is not None else ""
     for i in range(len(parts), 0, -1):
         folder = "/".join(parts[:i])
-        cand = ROOT / folder / ".goal"
+        cand = LOCK_TREE / folder / ".goal"
         if not cand.is_dir():
             continue
         if skip is not None and cand.resolve() == skip:

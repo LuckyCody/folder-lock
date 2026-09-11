@@ -74,11 +74,11 @@ def _lock_dir_for(rel: str) -> Path:
         sys.exit(4)
     if res.kind in ("registry", "root") and res.lock_dir:
         return res.lock_dir
-    return ROOT / rel / ".goal"
+    return lp.LOCK_TREE / rel / ".goal"
 
 
 def _rel_of(lock_dir: Path) -> str:
-    r = lock_dir.parent.relative_to(ROOT).as_posix()
+    r = lp.lock_rel(lock_dir.parent)          # v4.3: relative to the LOCK TREE, never to a worktree root
     return "" if r == "." else r
 
 
@@ -88,7 +88,7 @@ def _literal_lock_dir(rel: str, resolved: Path, me, adopt: bool = False):
     that folds a claimed folder into another home must not orphan its lock (v4.1)."""
     if not rel:
         return None
-    literal = ROOT / rel / ".goal"
+    literal = lp.LOCK_TREE / rel / ".goal"
     if literal.resolve() == resolved.resolve() or not (literal / "LOCK.yaml").is_file():
         return None
     mine = [li for li in lp.locks_at(literal) if li.kind == "interactive" and me and lp.same_window(li.window, me.window)]
@@ -123,7 +123,7 @@ def _session_handoffs() -> list:
         if kind != "staged" or rel in consumed or rel in out:
             continue
         target = rel.split("/.goal/", 1)[0]
-        if not (ROOT / target).is_dir():
+        if not (lp.LOCK_TREE / target).is_dir():
             continue  # target folder gone (fixture, filed drop): nothing left to be orphaned in
         out.append(rel)
     return out
@@ -412,13 +412,13 @@ def cmd_release(a) -> int:
         except Exception as e:  # noqa: BLE001
             print(f"note: inbox index unavailable ({e}) — handoff registration not verified")
     for h in staged:
-        hp = ROOT / h
+        hp = lp.LOCK_TREE / h
         if not hp.exists():
             # a vanished note whose target folder is freshly held by ANOTHER window was consumed by that
             # holder — the target's own signoff records it; not this session's orphan (v4.1)
             tgt = h.split("/.goal/", 1)[0]
-            foreign = [x for x in lp.locks_at(ROOT / tgt / ".goal") if not lp.same_window(x.window, me.window)] \
-                if (ROOT / tgt).is_dir() else []
+            foreign = [x for x in lp.locks_at(lp.LOCK_TREE / tgt / ".goal") if not lp.same_window(x.window, me.window)] \
+                if (lp.LOCK_TREE / tgt).is_dir() else []
             if foreign:
                 print(f"note: handoff {h} consumed by the current holder of {tgt} ({foreign[0].window}) — not an orphan")
                 continue
@@ -454,7 +454,7 @@ def cmd_check(a) -> int:
     me = _me()
     resolved = _lock_dir_for(rel)
     code = _report(resolved, me)
-    literal = ROOT / rel / ".goal" if rel else None
+    literal = lp.LOCK_TREE / rel / ".goal" if rel else None
     if literal is not None and literal.resolve() != resolved.resolve() and (literal / "LOCK.yaml").is_file():
         print(f"note: {rel} also carries its OWN LOCK.yaml (registry maps the folder to {_rel_of(resolved) or '<root>'}):")
         code = max(code, _report(literal, me))
@@ -475,7 +475,7 @@ def cmd_consume(a) -> int:
         return 5
     rel = a.path.replace("\\", "/").strip("/")
     target = rel.split("/.goal/", 1)[0]
-    locks = lp.locks_at(ROOT / target / ".goal") if (ROOT / target).is_dir() else []
+    locks = lp.locks_at(lp.LOCK_TREE / target / ".goal") if (lp.LOCK_TREE / target).is_dir() else []
     fresh_foreign = [li for li in locks if not lp.same_window(li.window, me.window) and li.fresh]
     mine = [li for li in locks if lp.same_window(li.window, me.window)]
     if fresh_foreign and not mine:
@@ -487,9 +487,9 @@ def cmd_consume(a) -> int:
         print(f"nothing to do: {rel} is not an unconsumed handoff of this session")
         return 0
     lp.record_handoff(_sid(), "consumed", rel)
-    if (ROOT / rel).exists():
+    if (lp.LOCK_TREE / rel).exists():
         try:
-            (ROOT / rel).unlink()
+            (lp.LOCK_TREE / rel).unlink()
             print(f"consumed + deleted {rel}")
         except OSError as e:
             print(f"consumed (file left in place: {e}) {rel}")
@@ -548,7 +548,7 @@ def cmd_mine(a) -> int:
     if not folders:
         print(f"window {me.window}: no folders bound")
     for f in folders:
-        for li in lp.locks_at(ROOT / (f if f != "." else "") / ".goal"):
+        for li in lp.locks_at(lp.LOCK_TREE / (f if f != "." else "") / ".goal"):
             if lp.same_window(li.window, me.window):
                 print(f"{f}: {li.describe()}")
     for h in _session_handoffs():

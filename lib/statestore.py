@@ -25,7 +25,7 @@ Backends:
                   that each keep their own state root (the tree is shared, the coordination state is not).
   blob            FOLDER_LOCK_STATE_BACKEND=blob + FOLDER_LOCK_STATE_ACCOUNT=<azure storage account>
                   [+ FOLDER_LOCK_STATE_CONTAINER, default folder-lock-state]. Azure Blob with If-Match ETag writes,
-                  DefaultAzureCredential (`az login` on a PC, managed identity in the cloud). Right for several
+                  an EXPLICIT credential chain — env -> az CLI -> managed identity LAST (`credential()`; v4.3). Right for several
                   machines sharing ONE working tree over a sync tool (the case that produced this module).
   FOLDER_LOCK_STATE_OFFLINE=1 forces the offline path (tests).
 
@@ -96,13 +96,36 @@ def _blob(name: str):
         raise Unavailable("FOLDER_LOCK_STATE_BACKEND=blob but FOLDER_LOCK_STATE_ACCOUNT is unset")
     if _client is None:
         try:
-            from azure.identity import DefaultAzureCredential
             from azure.storage.blob import BlobServiceClient
         except ImportError as e:
             raise Unavailable(f"azure sdk missing (pip install azure-identity azure-storage-blob): {e}")
-        cred = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+        cred = credential()
         _client = BlobServiceClient(f"https://{ACCOUNT}.blob.core.windows.net", credential=cred).get_container_client(CONTAINER)
     return _client.get_blob_client(f"{name}.json")
+
+
+_cred = None
+AZ_CLI_TIMEOUT_S = int(os.environ.get("FOLDER_LOCK_STATE_AZ_CLI_TIMEOUT", "30"))
+
+
+def credential():
+    """ONE credential per process, in an EXPLICIT order: EnvironmentCredential -> AzureCliCredential(process_timeout)
+    -> ManagedIdentityCredential — last, and only when an identity endpoint exists (IDENTITY_ENDPOINT / MSI_ENDPOINT) or
+    FOLDER_LOCK_STATE_MANAGED_IDENTITY=1. NOT DefaultAzureCredential: it probes managed identity FIRST, and on an
+    Azure-Arc-enrolled machine that probe fails HARD (ClientAuthenticationError, not CredentialUnavailable) after 20-30 s
+    per attempt, so every items/board/lock call took 40-120 s and writes sat in the outbox (v4.3). The az CLI login is
+    the working path on a PC; the order — not the endpoint check alone — is the fix (Arc hosts DO set the endpoints)."""
+    global _cred
+    if _cred is None:
+        try:
+            from azure.identity import AzureCliCredential, ChainedTokenCredential, EnvironmentCredential, ManagedIdentityCredential
+        except ImportError as e:
+            raise Unavailable(f"azure sdk missing (pip install azure-identity): {e}")
+        chain = [EnvironmentCredential(), AzureCliCredential(process_timeout=AZ_CLI_TIMEOUT_S)]
+        if os.environ.get("IDENTITY_ENDPOINT") or os.environ.get("MSI_ENDPOINT") or os.environ.get("FOLDER_LOCK_STATE_MANAGED_IDENTITY"):
+            chain.append(ManagedIdentityCredential())
+        _cred = ChainedTokenCredential(*chain)
+    return _cred
 
 
 def _backend_get(name: str) -> tuple:

@@ -64,7 +64,7 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="owner-only: bypass the §13 dedup")
     a = ap.parse_args()
     target_rel = a.to.replace("\\", "/").strip("/")
-    target = ROOT / target_rel if target_rel not in ("", ".") else ROOT
+    target = lp.LOCK_TREE / target_rel if target_rel not in ("", ".") else lp.LOCK_TREE   # v4.3: notes live in the lock tree
     target_rel = target_rel or "."
     if not target.is_dir():
         print(f"ERROR: target folder not found: {target}", file=sys.stderr)
@@ -101,14 +101,14 @@ def main() -> int:
         print(f"(item not recorded: {_e})", file=sys.stderr)
     sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
     if sid:  # sidecar ledger (v4.1): survives every rewrite of the binding YAML; release checks it
-        lp.record_handoff(sid, "staged", note.relative_to(ROOT).as_posix())
+        lp.record_handoff(sid, "staged", lp.lock_rel(note))
     if mode == "fire":
         (target / ".goal" / "state.yaml").write_text(
             f"goal: {_yaml_str(a.task + ' (handoff from ' + (a.source or 'dispatcher') + ' - read .goal/inbox/' + note.name + ' first)')}\n"
             f"status: in_progress\ncriteria_met: []\ncriteria_remaining:\n  - {_yaml_str(a.task)}\n", encoding="utf-8")
-        print(f"FIRED: {note.relative_to(ROOT).as_posix()} + .goal/state.yaml (your headless runner picks it up)")
+        print(f"FIRED: {lp.lock_rel(note)} + .goal/state.yaml (your headless runner picks it up)")
     else:
-        print(f"STAGED: {note.relative_to(ROOT).as_posix()} (read by whoever next claims {target_rel})")
+        print(f"STAGED: {lp.lock_rel(note)} (read by whoever next claims {target_rel})")
     return 0
 
 

@@ -62,7 +62,7 @@ Do not render the owner's menu and do not start another item in this session: th
 python <skill>/scripts/install.py [<repo>] --claude-hooks
 ```
 
-Copies `hooks/*` + `lib/*` to `<repo>/.githooks/`, sets `core.hooksPath`, gitignores `**/.goal/`, merges the PreToolUse + Stop + PostToolUse(Read) hooks into `.claude/settings.json` (omit the flag to just print the JSON), then **runs `check_locks.py --self-test`** (7 cases). Install is not done until it says PASS. Re-run in every clone and worktree. Runtime state (bindings, guard log, the state store) lives in `%LOCALAPPDATA%\folder-lock\<repo-hash>` or `FOLDER_LOCK_STATE_ROOT` — never in the tree (PROTOCOL §14); a repo upgraded from ≤4.1 runs `python <skill>/lib/statestore.py migrate --purge` once. When the owner asks "does the hook actually work": `python <skill>/scripts/selftest.py` and `bash <skill>/tests/conflict_run.sh` (21 scenarios, real refusals, hook stdin/stdout for 1, 6, 9) — paste the result, never answer from the fact that the file exists.
+Copies `hooks/*` + `lib/*` to `<repo>/.githooks/`, sets `core.hooksPath`, gitignores `**/.goal/`, merges the PreToolUse (edit guard + destructive-git guard) + Stop + PostToolUse(Read) hooks into `.claude/settings.json` (omit the flag to just print the JSON), then **runs `check_locks.py --self-test`** (7 cases). Install is not done until it says PASS. Re-run in every clone and worktree. Runtime state (bindings, guard log, the state store) lives in `%LOCALAPPDATA%\folder-lock\<repo-hash>` or `FOLDER_LOCK_STATE_ROOT` — never in the tree (PROTOCOL §14); a repo upgraded from ≤4.1 runs `python <skill>/lib/statestore.py migrate --purge` once. When the owner asks "does the hook actually work": `python <skill>/scripts/selftest.py` and `bash <skill>/tests/conflict_run.sh` (24 scenarios, real refusals, hook stdin/stdout for 1, 6, 9) — paste the result, never answer from the fact that the file exists.
 
 ## Behaviours this skill forbids
 
@@ -90,6 +90,7 @@ hooks/pre-commit             shim: check_locks + protect_main; no python = no co
 hooks/check_locks.py         commit guard, fail closed; --self-test, --verify-wiring
 hooks/protect_main.py        refuse plain commits on main/master (MAIN_COMMIT_OK=1)
 hooks/require_lock.py        PreToolUse edit guard (Edit/Write/MultiEdit/NotebookEdit)
+hooks/require_safe_git.py    PreToolUse guard on Bash|PowerShell: whole-tree destructive git (clean, stash -u/-a, checkout/restore .) refused in EVERY permission mode (v4.3)
 hooks/require_signoff.py     Stop hook: no ending a turn with a closing lock
 lib/deployunits.py           deploy units (.folder-lock/deploy-units.yaml): path -> unit, dirty check, test markers
 scripts/lock.py              claim | adopt | close | reopen | release | check | consume | reader | who | whoami | mine | status
@@ -101,7 +102,8 @@ scripts/test_unit.py         run a unit's tests, leave the per-window marker the
 scripts/deploy_selftest.py   prove the queue: collapse, already-deployed, failure+back-off, dirty-tree block, guard warning
 scripts/install.py           copy hooks+lib, hooksPath, .gitignore, --claude-hooks, self-test
 scripts/selftest.py          commit-guard self-test + protected-branch cases
-tests/conflict_run.sh        21-scenario proof of which guardrail is active where (own throwaway state root)
+tests/conflict_run.sh        24-scenario proof of which guardrail is active where (own throwaway state root + lock tree)
+tests/test_v43.py            unit ladder: timed tripwires, resurrected notes, lock tree, globs, credential chain, safe-git verdicts
 tests/autorun_run.py         seeded acceptance run of the loop (own throwaway state root)
 templates/                   LOCK.yaml, current-pointer.md, registry.yaml (per-module + core), deploy-units.yaml
 ```

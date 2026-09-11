@@ -65,7 +65,7 @@ def scan() -> list:
 
 
 def folder_locked(folder: str) -> str:
-    gdir = ROOT / folder / ".goal"
+    gdir = lp.LOCK_TREE / folder / ".goal"
     for name, fresh in (("LOCK.yaml", lp.LOCK_FRESH), (".firing.lock", lp.FIRING_FRESH)):
         p = gdir / name
         if p.exists():
@@ -78,7 +78,7 @@ def folder_locked(folder: str) -> str:
 
 
 def set_firing_lock(folder: str, key: str) -> str:
-    gdir = ROOT / folder / ".goal"
+    gdir = lp.LOCK_TREE / folder / ".goal"
     gdir.mkdir(parents=True, exist_ok=True)
     agent_id = mint.agent("autorun")
     (gdir / ".firing.lock").write_text(f'holder: fired\nwindow: "{agent_id}"\nstatus: open\ntask: "autorun {key}"\n'
@@ -145,7 +145,7 @@ def autorun(runner: str, owner_prefix: str = "", once: bool = False, timeout: in
                                  {"ICM_WINDOW": agent_id, "ICM_FOLDER": owner, "AUTORUN_ITEM": key, "AUTORUN_ITEM_KIND": item["kind"],
                                   "AUTORUN_ITEM_REF": item["ref"], "AUTORUN_ITEM_TITLE": item.get("title", "")}, timeout)
             finally:
-                (ROOT / owner / ".goal" / ".firing.lock").unlink(missing_ok=True)
+                (lp.LOCK_TREE / owner / ".goal" / ".firing.lock").unlink(missing_ok=True)
             fired += 1; totals["fired"] += 1
             err = res.get("_error") or (f"exit {res.get('exit_code')}" if res.get("exit_code") not in (0, None) else "")
             if res.get("_error"):

@@ -5,6 +5,7 @@
 # guards + scripts in; drives the violations the guards exist to stop. One line per scenario, PASS/FAIL, plus the
 # refusal text. Hook stdin/stdout for scenarios 1, 6, 9 printed in full.
 # 1-12 = the v2/v3 ladder · 13 = handoff sidecar · 14 = literal lock after a registry remap · 15-16 = state store
+# 22 = destructive-git hook · 23 = v4.3 unit ladder (tests/test_v43.py) · 24 = claim/handoff/release from a worktree cwd against the lock tree
 # (write race merges; offline -> outbox -> replay) · 17-19 = §15 proofs (conflict copies, rules hash, read coverage)
 # · 20 = §16 lock-holder view · 21 = reader identity. Result -> <skill's STATE_ROOT>/conflict_last.{json,txt}
 set -u
@@ -23,7 +24,7 @@ printf 'workflows:\n- id: fixture-flow\n  owns:\n  - fixture/**\n- id: other-flo
 FXW="$(cygpath -w "$FX" 2>/dev/null || echo "$FX")"; FXP="${FXW//\\//}"
 export FOLDER_LOCK_ROOT="$FXW"
 export FOLDER_LOCK_STATE_ROOT="$FXW\\.fl-state"; FLSTATE="$FXP/.fl-state"   # §14: fixture state root (bindings, store, guard log)
-unset ICM_WINDOW ICM_LOCK_BYPASS CLAUDE_CODE_SESSION_ID ICM_FOLDER MAIN_COMMIT_OK FOLDER_LOCK_STATE_BACKEND FOLDER_LOCK_STATE_OFFLINE FOLDER_LOCK_HOST
+unset ICM_WINDOW ICM_LOCK_BYPASS CLAUDE_CODE_SESSION_ID ICM_FOLDER MAIN_COMMIT_OK FOLDER_LOCK_STATE_BACKEND FOLDER_LOCK_STATE_OFFLINE FOLDER_LOCK_HOST FOLDER_LOCK_LOCK_TREE ICM_ALLOW_DESTRUCTIVE_GIT
 cd "$FX"
 git init -q -b main . && git config user.email t@x.invalid && git config user.name conflict-test && git config commit.gpgsign false
 git config core.hooksPath "$FXW\\.githooks"
@@ -233,6 +234,42 @@ ok=0; [ $r21a -eq 0 ] && grep -q "^READER menu-" <<<"$o21a" && grep -q "^READER 
 LAST_OUT="reader: $(first_line "$o21a" | cut -c1-60) | edit: exit $r21b (reader named: $(grep -c 'reader identity' <<<"$o21b")) | stop: exit $r21c, guard_log pass lines $n21c | claim: exit $r21d -> window $WIN_R"
 record 21 $ok "reader identity: READER window, edit denied (reader), stop passes, claim replaces the reader binding with window-r-*"
 CLAUDE_CODE_SESSION_ID=sess-r $LOCK release fixture --allow-dirty "fixture test" >>"$TR" 2>&1
+
+section "22. Destructive-git hook (v4.3, PreToolUse on Bash|PowerShell): whole-tree wipes refused (exit 2), named paths + dry runs pass, owner override allowed + logged"
+hook_sh() { local tool="$1" cmd="$2"; LAST_IN=$(printf '{"session_id":"sess-a","hook_event_name":"PreToolUse","tool_name":"%s","tool_input":{"command":"%s"}}' "$tool" "$cmd"); LAST_OUT=$(printf '%s' "$LAST_IN" | $PY .githooks/require_safe_git.py 2>&1); LAST_RC=$?; return $LAST_RC; }
+G="git "   # guard inputs are built by concatenation: the guard is text-based over the command line (README v4.3)
+hook_sh Bash "${G}clean -fdx"; r22a=$LAST_RC; o22a="$LAST_OUT"; IN22="$LAST_IN"
+hook_sh PowerShell "${G}stash push -u -m x"; r22b=$LAST_RC
+hook_sh Bash "${G}checkout -- ."; r22c=$LAST_RC
+hook_sh Bash "${G}clean -n"; r22d=$LAST_RC
+hook_sh Bash "${G}checkout -- fixture/f.txt"; r22e=$LAST_RC
+hook_sh Bash "${G}status --short"; r22f=$LAST_RC
+o22g=$(printf '%s' "$IN22" | ICM_ALLOW_DESTRUCTIVE_GIT=1 $PY .githooks/require_safe_git.py 2>&1); r22g=$?
+GL="$FLSTATE/guard_log.jsonl"; n22=$(grep -c "require_safe_git" "$GL" 2>/dev/null || echo 0); n22o=$(grep -c "ICM_ALLOW_DESTRUCTIVE_GIT=1" "$GL" 2>/dev/null || echo 0)
+ok=0; [ $r22a -eq 2 ] && grep -q '"permissionDecision": "deny"' <<<"$o22a" && [ $r22b -eq 2 ] && [ $r22c -eq 2 ] && [ $r22d -eq 0 ] && [ $r22e -eq 0 ] && [ $r22f -eq 0 ] && [ $r22g -eq 0 ] && [ "$n22" -ge 4 ] && [ "$n22o" -ge 1 ] && ok=1
+LAST_OUT="$(first_line "$o22a" | cut -c1-120) | wipes: $r22a/$r22b/$r22c | dry-run $r22d, named path $r22e, status $r22f | override exit $r22g, logged $n22o"
+record 22 $ok "destructive-git hook: clean / stash -u / checkout -- . -> deny exit 2; dry run + named path + status pass; ICM_ALLOW_DESTRUCTIVE_GIT=1 passes and is logged"
+
+section "23. v4.3 unit ladder (tests/test_v43.py): timed tripwires, resurrected notes, lock tree, globs + tie-break, credential chain order, safe-git verdicts"
+o23=$(cd "$SK" && env -u FOLDER_LOCK_ROOT -u FOLDER_LOCK_STATE_ROOT $PY tests/test_v43.py 2>&1); r23=$?
+ok=0; [ $r23 -eq 0 ] && grep -q "ALL PASS" <<<"$o23" && ok=1
+LAST_OUT="$(tail -1 <<<"$o23")"
+record 23 $ok "unit ladder: $(tail -1 <<<"$o23")"
+
+section "24. Lock tree (v4.3): a headless agent on a git WORKTREE (no .goal/ there) claims, stages a handoff and releases against the canonical lock tree; the canonical checkout sees the lock"
+WT="$TMP/worktree"; git worktree add -q "$WT" -b wt/agent >>"$TR" 2>&1; WTW="$(cygpath -w "$WT" 2>/dev/null || echo "$WT")"
+o24a=$(FOLDER_LOCK_ROOT="$WTW" FOLDER_LOCK_LOCK_TREE="$FXW" CLAUDE_CODE_SESSION_ID=sess-w $LOCK claim fixture --task "W works fixture from a worktree" --hint window-w 2>&1); r24a=$?
+o24b=$(CLAUDE_CODE_SESSION_ID=sess-b $LOCK check fixture 2>&1); r24b=$?                       # canonical view: the lock is there
+o24c=$(FOLDER_LOCK_ROOT="$WTW" FOLDER_LOCK_LOCK_TREE="$FXW" CLAUDE_CODE_SESSION_ID=sess-w $PY _skill/scripts/handoff.py --to other --task "note from the worktree" --from fixture 2>&1); r24c=$?
+mkdir -p "$WT/fixture/workflow-state"; printf '# ptr\nNext concrete action: NONE — worktree fixture done\n' > "$WT/fixture/workflow-state/current-pointer.md"
+o24d=$(FOLDER_LOCK_ROOT="$WTW" FOLDER_LOCK_LOCK_TREE="$FXW" CLAUDE_CODE_SESSION_ID=sess-w $LOCK release fixture --allow-dirty "fixture test" 2>&1); r24d=$?
+ok=0; [ $r24a -eq 0 ] && grep -q "^CLAIMED fixture" <<<"$o24a" && [ -f fixture/.goal/LOCK.yaml ] || [ $r24d -eq 0 ]; \
+  [ $r24a -eq 0 ] && grep -q "^CLAIMED fixture" <<<"$o24a" && [ ! -d "$WT/fixture/.goal" ] && [ $r24b -eq 1 ] && grep -q "^LOCKED fixture" <<<"$o24b" \
+  && [ $r24c -eq 0 ] && grep -q "^STAGED: other/.goal/inbox/" <<<"$o24c" && ls other/.goal/inbox/*.md >/dev/null 2>&1 \
+  && [ $r24d -eq 0 ] && grep -q "RELEASED" <<<"$o24d" && [ ! -f fixture/.goal/LOCK.yaml ] && ok=1
+LAST_OUT="claim from worktree: exit $r24a ($(first_line "$o24a" | cut -c1-50)); .goal in worktree: $([ -d "$WT/fixture/.goal" ] && echo YES || echo no) | canonical check: exit $r24b | handoff: $(first_line "$o24c" | cut -c1-70) | release: exit $r24d, LOCK.yaml gone: $([ ! -f fixture/.goal/LOCK.yaml ] && echo yes || echo NO)"
+record 24 $ok "lock tree: worktree agent claims -> LOCK.yaml in the canonical tree only; canonical check LOCKED; handoff note lands in the lock tree (lock_rel path); release from the worktree deletes it"
+git worktree remove --force "$WT" >>"$TR" 2>&1 || true
 
 cd "$SK"; rm -rf "$TMP"
 section "summary"; ALL=1

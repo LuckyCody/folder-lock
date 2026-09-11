@@ -6,7 +6,7 @@
   2. sets `git config core.hooksPath .githooks` — and tells you if it pointed elsewhere
      (a stale hooksPath is exactly how a hook silently stops running)
   3. adds `**/.goal/` to .gitignore (locks, sessions, guard log = runtime state)
-  4. --claude-hooks: merges the PreToolUse edit guard + Stop guard + PostToolUse read-coverage proof into <repo>/.claude/settings.json
+  4. --claude-hooks: merges the PreToolUse edit guard + destructive-git guard (v4.3) + Stop guard + PostToolUse read-coverage proof into <repo>/.claude/settings.json
      (existing hooks kept; prints the JSON otherwise so you can wire it by hand)
   5. runs `check_locks.py --self-test` — a hook you have not tried to break is a hook you are
      assuming works. Install is not done until it says PASS.
@@ -27,7 +27,9 @@ SKILL = HERE.parent
 
 CLAUDE_HOOKS = {
     "PreToolUse": [{"matcher": "Edit|Write|MultiEdit|NotebookEdit",
-                    "hooks": [{"type": "command", "command": "python .githooks/require_lock.py", "timeout": 20}]}],
+                    "hooks": [{"type": "command", "command": "python .githooks/require_lock.py", "timeout": 20}]},
+                   {"matcher": "Bash|PowerShell",     # v4.3: destructive-git guard — runs in every permission mode
+                    "hooks": [{"type": "command", "command": "python .githooks/require_safe_git.py", "timeout": 10}]}],
     "Stop": [{"hooks": [{"type": "command", "command": "python .githooks/require_signoff.py", "timeout": 20}]}],
     "PostToolUse": [{"matcher": "Read",
                      "hooks": [{"type": "command", "command": "python .githooks/check_pointer_read.py", "timeout": 10}]}],
@@ -93,7 +95,7 @@ def main(argv: list) -> int:
                     cur.append(entry)
         settings.parent.mkdir(parents=True, exist_ok=True)
         settings.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        print(f"merged PreToolUse + Stop + PostToolUse(Read) guards into {settings.relative_to(repo).as_posix()} (Claude Code reloads hooks live)")
+        print(f"merged PreToolUse (edit + destructive-git) + Stop + PostToolUse(Read) guards into {settings.relative_to(repo).as_posix()} (Claude Code reloads hooks live)")
     else:
         print("\nClaude Code edit-time + Stop + read-coverage guards are NOT wired (pass --claude-hooks, or add to .claude/settings.json):")
         print(json.dumps({"hooks": CLAUDE_HOOKS}, indent=2))

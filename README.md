@@ -40,7 +40,7 @@ Expected tail:
 INSTALLED and PROVEN. Repeat in every clone/worktree.
 ```
 
-Then prove the whole ladder: `bash .claude/skills/folder-lock/tests/conflict_run.sh` — 21 scenarios (plus `python scripts/deploy_selftest.py` for the deploy queue and `python tests/autorun_run.py` for the loop), each ending in a visible refusal (or a visible pass where a pass is the point), with hook stdin/stdout printed for the edit, Stop and no-identity cases. Every fixture uses its own throwaway state root — the live store is never touched.
+Then prove the whole ladder: `bash .claude/skills/folder-lock/tests/conflict_run.sh` — 24 scenarios (plus `python scripts/deploy_selftest.py` for the deploy queue and `python tests/autorun_run.py` for the loop), each ending in a visible refusal (or a visible pass where a pass is the point), with hook stdin/stdout printed for the edit, Stop and no-identity cases. Every fixture uses its own throwaway state root — the live store is never touched.
 
 ## Daily shape
 
@@ -83,6 +83,19 @@ workflows:
   - finance/payroll/**
   - .claude/skills/payroll/**        # locks at finance/payroll/.goal — one lock per workflow home
 ```
+
+## What's new in v4.3
+
+Fixes and guards that fell out of running v4.2 for a day with headless agents on their own git worktrees.
+
+- **Timed tripwires** (`lib/items.py timed_due`): `WHEN 2026-09-12 14:15 Berlin has passed → <action>` derives `waiting_world` until that instant and `ready` from then on — the loop fires the action at the instant, never early, and never re-arms it. A date inside prose is not a timer; a condition that also names the owner stays `waiting_owner`. Clock: Europe/Berlin, or `FOLDER_LOCK_TZ=<IANA zone>`.
+- **Resurrected notes never re-fire** (`items.sync`): a consumed handoff whose file comes back through a sync re-scan or a rollback wave stays `done`, the file is deleted, ONE `resurrected, skipped` line lands in the owner's autorun log. Read-only renders leave the file alone.
+- **Lock tree for worktree agents** (`lib/lockpath.py LOCK_TREE`, `lock_rel`): `FOLDER_LOCK_LOCK_TREE=<canonical checkout>` lets a process running from a git worktree (whose gitignored `.goal/` dirs do not exist) see the one set of locks, inbox notes and the deploy queue; `lock.py`, `handoff.py`, `autorun.py` and the edit guard print lock paths relative to that tree instead of crashing with `ValueError` on `.relative_to(ROOT)` — the crash used to hit the very `release` that would have ended the session. Default: the code root; nothing changes for a plain checkout.
+- **Destructive-git hook** (`hooks/require_safe_git.py`, PreToolUse on `Bash|PowerShell`): refuses `git clean` (dry runs pass), `git stash` with `-u`/`-a`/`--include-untracked`, and whole-tree `git checkout -- .` / `git restore .`; named paths pass; `ICM_ALLOW_DESTRUCTIVE_GIT=1` is the logged owner override. Hooks run in every permission mode — including `bypassPermissions`, where the `permissions.ask` rules are silent and headless agents live. `install.py --claude-hooks` wires it. **The guard is text-based over the whole command line**: a commit message, an `echo` payload or a heredoc quoting one of the forms is refused too — build test inputs by string concatenation (`"git " + "clean -fdx"`) and word commit messages without `git` in front of the form. The live deny through the harness IS the wiring proof.
+- **Explicit credential chain** (`lib/statestore.py credential()`, blob backend): `EnvironmentCredential → AzureCliCredential(process_timeout) → ManagedIdentityCredential` (last, and only when an identity endpoint exists or `FOLDER_LOCK_STATE_MANAGED_IDENTITY=1`). `DefaultAzureCredential` probes managed identity FIRST; on an Azure-Arc-enrolled machine that fails hard after 20–30 s per attempt, so every board render took 40–120 s and writes sat in the outbox. The order is the fix — Arc hosts DO set the identity endpoints, so an endpoint check alone changes nothing.
+- **Registry globs**: `**/x/**` now matches (`_glob_match` takes the fast path only for the plain `<dir>/**` form); an exact-file `owns:` entry beats `<dir>/**` over the same directory (`workflow_for` scores fixed-prefix length, then exact file). Folder-vs-folder resolution is unchanged.
+- **Not ported, deliberately: a memory mirror.** The workspace this skill comes from snapshots each host's agent-memory directory into the repo — one tracked directory per host, self-staging at signoff (`git add -A` of its own output, so the closing commit carries the delta without the signoff knowing the path), and a manifest that names skipped secrets by CLASS label only, never by excerpt (an early manifest quoted the first 24 characters of what the skip protected). That is an installation ritual, not a lock rule; if you want one, those three properties are the spec.
+- **Tests**: `tests/test_v43.py` (plain `python` or pytest, 16 checks) + `tests/conflict_run.sh` scenarios 22 (destructive-git hook), 23 (the unit ladder), 24 (claim / handoff / release from a worktree cwd against the canonical lock tree) — 24/24.
 
 ## What's new in v4.2
 

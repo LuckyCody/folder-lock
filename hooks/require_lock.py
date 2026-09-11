@@ -111,7 +111,7 @@ def main() -> int:
         return _allow(f"whitelist: {wl}", ctx)
     lit = lp.literal_lock(rel, res)   # v4.1: closest existing lock wins (registry remapped a claimed folder)
     if lit is not None:
-        lit_folder = lit.path.parent.parent.relative_to(lp.ROOT).as_posix()
+        lit_folder = lp.lock_rel(lit.path.parent.parent)
         if lp.same_window(lit.window, me.window):
             return _allow(f"own fresh literal lock on {lit_folder} (registry maps the path to {res.folder or '<root>'})", ctx)
         return _deny(f"{rel} is inside folder '{lit_folder}', which carries its own fresh lock held by another session: "

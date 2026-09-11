@@ -23,6 +23,9 @@ each installation fills in its own list — the code only enforces that a waitin
     python lib/items.py wait <key> --question "<Q. Options: a/b/c. Recommendation: x>"
     python lib/items.py from-pointer <folder> [--created-by F]
     python lib/items.py check-dup --owner F --title T        # exit 4 on a duplicate
+
+v4.3: `timed_due(condition)` — `WHEN <YYYY-MM-DD[ HH:MM]> [Berlin] has passed -> <action>` is waiting_world until the
+instant and ready from then on (never early, never re-armed); a resurrected `done` handoff file is deleted + logged once.
 """
 from __future__ import annotations
 
@@ -40,6 +43,51 @@ ROOT = lp.ROOT
 STATUSES = ("ready", "in_progress", "waiting_owner", "done", "waiting_world", "parked")
 OWNER_RE = re.compile(r"\b(owner|ruling|rules?\s+on|approv\w*|decision|decides?|confirm\w*|says)\b", re.I)
 _ARROW = re.compile(r"\s*(?:→|->)\s*")
+# TIMED tripwire condition (v4.3): an ISO instant (date, optional HH:MM, optional zone word) followed by a "has passed"
+# cue, or the condition IS just that instant (`WHEN 2026-09-12 14:15 Berlin → …`). The zone word is documentary — the
+# clock is Europe/Berlin (PROTOCOL §3); set FOLDER_LOCK_TZ to another IANA zone for an installation elsewhere.
+_ISO = r"(?P<date>\d{4}-\d{2}-\d{2})(?:[T ](?P<hh>\d{1,2}):(?P<mm>\d{2}))?"
+_ZONE = r"(?:\s*\(?(?:Europe/)?(?:Berlin|CES?T|MES?Z|UTC(?:[+-]\d{1,2}(?::?\d{2})?)?)\)?)?"
+_CUE = r"(?:has\s+passed|is\s+(?:past|over|reached)|passed|reached|elapsed|arrives?|ist\s+(?:vorbei|erreicht|abgelaufen)|vorbei|erreicht|abgelaufen)"
+_INSTANT_RE = re.compile(_ISO + _ZONE + r"(?P<cue>\s*(?:" + _CUE + r"))?", re.I)
+_LEAD_RE = re.compile(r"^\W*(?:(?:the\s+)?(?:time|date|clock|now|it)\s+(?:is\s+)?(?:>=|≥|past|after|at\s+or\s+after)?\s*)?", re.I)
+
+
+def timed_due(condition: str):
+    """The instant a TIMED tripwire waits for (tz-aware), or None when the condition is not timed.
+    Timed = the instant is followed by a 'has passed' cue, OR the whole condition is just the instant (+ lead-in).
+    A date inside prose ("X replies to the 2026-09-10 16:08 request") is NOT a timer.
+    Date without a time = 00:00 of that day (the date 'has passed' once it starts)."""
+    cond = condition or ""
+    import datetime as _dt
+    for m in _INSTANT_RE.finditer(cond):
+        whole = _LEAD_RE.sub("", cond[:m.start()]).strip() == "" and cond[m.end():].strip(" .!?;,") == ""
+        if not (m.group("cue") or whole):
+            continue
+        try:
+            d = _dt.date.fromisoformat(m.group("date"))
+            hh, mm = int(m.group("hh") or 0), int(m.group("mm") or 0)
+            if not (0 <= hh < 24 and 0 <= mm < 60):
+                return None
+            return _dt.datetime.combine(d, _dt.time(hh, mm), tzinfo=_tz())
+        except ValueError:
+            return None
+    return None
+
+
+def _tz():
+    import os as _os
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(_os.environ.get("FOLDER_LOCK_TZ") or "Europe/Berlin")
+    except Exception:                                # no tzdata on this host: the local clock is the installation's clock
+        import datetime as _dt
+        return _dt.datetime.now().astimezone().tzinfo
+
+
+def now_tz():
+    import datetime as _dt
+    return _dt.datetime.now(_tz())
 
 
 class Duplicate(Exception):
@@ -176,8 +224,9 @@ def record_fail(key: str, error: str, threshold: int = 3) -> dict:
 
 # ---------------------------------------------------------------- derivation
 
-def classify_pointer_line(line: str) -> tuple[str, str | None]:
-    """(status, auto question) for a pointer's `Next concrete action:` text (PROTOCOL §3 grammar)."""
+def classify_pointer_line(line: str, now=None) -> tuple[str, str | None]:
+    """(status, auto question) for a pointer's `Next concrete action:` text (PROTOCOL §3 grammar).
+    `now` (tz-aware) only for tests of timed tripwires."""
     low = (line or "").strip().lower()
     if not low:
         return "ready", None                      # mute pointer: fixing it IS the work
@@ -192,6 +241,12 @@ def classify_pointer_line(line: str) -> tuple[str, str | None]:
         if OWNER_RE.search(cond):
             return "waiting_owner", (f"{cond.rstrip('.?')}? Options: (a) yes -> then: {act or 'continue per the pointer'}; "
                                      f"(b) not yet -> keep waiting; (c) drop the item. Recommendation: (a) once true, else (b).")
+        due = timed_due(cond)
+        if due is not None:
+            # TIMED tripwire (v4.3): armed until the instant, READY from then on — the action line is the work;
+            # the loop fires it at the instant, never early, and the agent rewrites the pointer (never re-arm)
+            now = now or now_tz()
+            return ("ready" if now >= due else "waiting_world"), None
         return "waiting_world", None
     return "ready", None
 
@@ -207,10 +262,37 @@ def pointer_line(folder: str) -> str:
     return ""
 
 
-def sync(rows: list) -> dict:
+def _resurrected(folder: str, ref: str, e: dict, now: str) -> None:
+    """A consumed handoff note that came back (sync re-scan / rollback wave; v4.3): keep it done, remove the file,
+    log ONE line in the owner folder's autorun log. Never fires. Renders marked READONLY leave the file alone."""
+    import statestore
+    e["updated"] = now
+    if statestore.READONLY:
+        return
+    p = lp.LOCK_TREE / folder / ".goal" / "inbox" / ref
+    if e.get("resurrected") == ref and not p.exists():
+        return
+    e["resurrected"] = ref
+    gone = ""
+    try:
+        if p.is_file():
+            p.unlink()
+            gone = "file deleted"
+    except OSError as ex:
+        gone = f"file left in place: {ex}"
+    try:
+        import autorun_log
+        autorun_log.append(folder, e.get("title", ref), "done", commit="-",
+                           decisions=f"resurrected, skipped — already done ({e.get('outcome') or 'state store'}); {gone or 'no file'}")
+    except Exception as ex:  # noqa: BLE001 — a log failure must not break a render
+        print(f"items: resurrected note {folder}/{ref} — log line failed: {ex}", file=sys.stderr)
+
+
+def sync(rows: list, data: dict | None = None) -> dict:
     """Reconcile the overlay with derived rows [{folder, kind, ref, title, line?, from?}]. Absent -> done.
-    Never overrides in_progress; never replaces an agent's own question with an auto-drafted one."""
-    data = load()
+    Never overrides in_progress; never replaces an agent's own question with an auto-drafted one.
+    A `done` handoff whose file reappears stays done (v4.3, `_resurrected`). `data` only for tests."""
+    data = data if data is not None else load()
     live = {}
     now = mint.timestamp()
     for r in rows:
@@ -230,6 +312,10 @@ def sync(rows: list) -> dict:
             changed = norm_title(e.get("title", "")) != norm_title(title)
             e["title"], e["owner"] = title[:300], owner_of(folder)
             cur = e.get("status")
+            if cur == "done" and kind == "handoff" and not changed:
+                _resurrected(folder, ref, e, now)      # consumed note came back: stays done, file goes, one log line
+                live[k] = e
+                continue
             if cur == "in_progress" or (e.get("stuck") and not changed) or (cur == "waiting_owner" and not e.get("question_auto") and not changed):
                 pass
             elif cur != derived or changed:
