@@ -12,6 +12,8 @@
      assuming works. Install is not done until it says PASS.
 
 Re-run in EVERY clone and EVERY worktree: core.hooksPath is per-repo config, it does not travel.
+Hook commands are anchored to "$CLAUDE_PROJECT_DIR" (v5): a cwd-relative `python .githooks/x.py` breaks the moment a
+session's shell cd's into a subfolder — every hook then fails closed and the session is wedged.
 """
 from __future__ import annotations
 
@@ -27,12 +29,16 @@ SKILL = HERE.parent
 
 CLAUDE_HOOKS = {
     "PreToolUse": [{"matcher": "Edit|Write|MultiEdit|NotebookEdit",
-                    "hooks": [{"type": "command", "command": "python .githooks/require_lock.py", "timeout": 20}]},
+                    "hooks": [{"type": "command", "command": "python \"$CLAUDE_PROJECT_DIR/.githooks/require_lock.py\"", "timeout": 20}]},
                    {"matcher": "Bash|PowerShell",     # v4.3: destructive-git guard — runs in every permission mode
-                    "hooks": [{"type": "command", "command": "python .githooks/require_safe_git.py", "timeout": 10}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "python .githooks/require_signoff.py", "timeout": 20}]}],
+                    "hooks": [{"type": "command", "command": "python \"$CLAUDE_PROJECT_DIR/.githooks/require_safe_git.py\"", "timeout": 10},
+                              # v5: shell write targets (>, >>, tee, Out-File, Set-Content) through the same verdict as the edit guard
+                              {"type": "command", "command": "python \"$CLAUDE_PROJECT_DIR/.githooks/require_write_scope.py\"", "timeout": 15}]}],
+    "SessionStart": [{"matcher": "startup|clear",      # v5: blank-window bootstrap — invariants, terminal block, triage
+                      "hooks": [{"type": "command", "command": "python \"$CLAUDE_PROJECT_DIR/.githooks/session_start.py\"", "timeout": 20}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "python \"$CLAUDE_PROJECT_DIR/.githooks/require_signoff.py\"", "timeout": 20}]}],
     "PostToolUse": [{"matcher": "Read",
-                     "hooks": [{"type": "command", "command": "python .githooks/check_pointer_read.py", "timeout": 10}]}],
+                     "hooks": [{"type": "command", "command": "python \"$CLAUDE_PROJECT_DIR/.githooks/check_pointer_read.py\"", "timeout": 10}]}],
 }
 
 
@@ -91,11 +97,16 @@ def main(argv: list) -> int:
             cur = hooks.setdefault(event, [])
             for entry in entries:
                 cmd = entry["hooks"][0]["command"]
-                if not any(cmd in json.dumps(e) for e in cur):
+                match = next((e for e in cur if e.get("matcher", "") == entry.get("matcher", "") and cmd in json.dumps(e)), None)
+                if match is None:
                     cur.append(entry)
+                    continue
+                for h in entry["hooks"][1:]:   # a later version added a second hook under the same matcher
+                    if h["command"] not in json.dumps(match):
+                        match["hooks"].append(h)
         settings.parent.mkdir(parents=True, exist_ok=True)
         settings.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        print(f"merged PreToolUse (edit + destructive-git) + Stop + PostToolUse(Read) guards into {settings.relative_to(repo).as_posix()} (Claude Code reloads hooks live)")
+        print(f"merged SessionStart (triage) + PreToolUse (edit + destructive-git + shell write scope) + Stop (terminal block) + PostToolUse(Read) guards into {settings.relative_to(repo).as_posix()} (Claude Code reloads hooks live)")
     else:
         print("\nClaude Code edit-time + Stop + read-coverage guards are NOT wired (pass --claude-hooks, or add to .claude/settings.json):")
         print(json.dumps({"hooks": CLAUDE_HOOKS}, indent=2))

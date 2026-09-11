@@ -282,6 +282,11 @@ def cmd_claim(a) -> int:
     if rel and not (ROOT / rel).is_dir():
         print(f"ERROR: not a folder: {ROOT / rel}", file=sys.stderr)
         return 4
+    import lifecycle as lc
+    if rel and lc.is_archived_folder(rel):
+        print(f"REFUSED: {rel} is ARCHIVED (PROTOCOL §17) — archived folders are never claimed. Restore it first: "
+              f"python scripts/new.py {rel.split('/')[-1]} --unarchive", file=sys.stderr)
+        return 7
     lock_dir = _lock_dir_for(rel)
     home = _rel_of(lock_dir)
     if home != rel:

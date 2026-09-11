@@ -7,7 +7,7 @@
 # 1-12 = the v2/v3 ladder · 13 = handoff sidecar · 14 = literal lock after a registry remap · 15-16 = state store
 # 22 = destructive-git hook · 23 = v4.3 unit ladder (tests/test_v43.py) · 24 = claim/handoff/release from a worktree cwd against the lock tree
 # (write race merges; offline -> outbox -> replay) · 17-19 = §15 proofs (conflict copies, rules hash, read coverage)
-# · 20 = §16 lock-holder view · 21 = reader identity. Result -> <skill's STATE_ROOT>/conflict_last.{json,txt}
+# · 20 = §16 lock-holder view · 21 = reader identity · 25-31 = §17 session lifecycle (terminal block, blank-window triage, new.py, archive, unarchive, write scope, headless agent). Result -> <skill's STATE_ROOT>/conflict_last.{json,txt}
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; SK="$(cd "$HERE/.." && pwd)"
 PY=python
@@ -19,7 +19,7 @@ section() { log ""; log "== $* =="; }
 
 TMP="$(mktemp -d)"; FX="$TMP/repo"; mkdir -p "$FX/.githooks/lib" "$FX/.folder-lock" "$FX/_skill"
 cp "$SK"/hooks/*.py "$SK"/hooks/pre-commit "$FX/.githooks/"; cp "$SK"/lib/*.py "$FX/.githooks/lib/"
-cp -r "$SK/lib" "$SK/scripts" "$FX/_skill/"
+cp -r "$SK/lib" "$SK/scripts" "$SK/templates" "$FX/_skill/"
 printf 'workflows:\n- id: fixture-flow\n  owns:\n  - fixture/**\n- id: other-flow\n  owns:\n  - other/**\n' > "$FX/.folder-lock/registry.yaml"
 FXW="$(cygpath -w "$FX" 2>/dev/null || echo "$FX")"; FXP="${FXW//\\//}"
 export FOLDER_LOCK_ROOT="$FXW"
@@ -37,7 +37,24 @@ log "fixture: $FX  hooksPath: $(git config core.hooksPath)  state root: $FOLDER_
 
 hook_edit() { local sid="$1" path="$2"; LAST_IN=$(printf '{"session_id":"%s","hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":"%s","old_string":"a","new_string":"b"}}' "$sid" "$FXP/$path"); LAST_OUT=$(printf '%s' "$LAST_IN" | $PY .githooks/require_lock.py 2>&1); LAST_RC=$?; return $LAST_RC; }
 hook_edit_env() { local win="$1" path="$2"; LAST_IN=$(printf '{"session_id":"","hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":"%s"}}' "$FXP/$path"); LAST_OUT=$(printf '%s' "$LAST_IN" | ICM_WINDOW="$win" $PY .githooks/require_lock.py 2>&1); LAST_RC=$?; return $LAST_RC; }
-hook_stop() { local sid="$1" pid="$2"; LAST_IN=$(printf '{"session_id":"%s","hook_event_name":"Stop","prompt_id":"%s","stop_hook_active":false}' "$sid" "$pid"); LAST_OUT=$(printf '%s' "$LAST_IN" | $PY .githooks/require_signoff.py 2>&1); LAST_RC=$?; return $LAST_RC; }
+hook_stop_text() {  # sid prompt_id "<final assistant message>" -> Stop guard with a fixture transcript (§17: the block is read from the transcript)
+  local sid="$1" pid="$2" text="$3" tr trp
+  tr="$TMP/transcript-$sid-$pid.jsonl"
+  $PY - "$tr" "$text" <<'PYT'
+import json, sys
+p, text = sys.argv[1], sys.argv[2]
+with open(p, "w", encoding="utf-8") as fh:
+    fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": "go"}}) + "\n")
+    fh.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}) + "\n")
+PYT
+  trp="$(cygpath -m "$tr" 2>/dev/null || echo "$tr")"
+  LAST_IN=$(printf '{"session_id":"%s","hook_event_name":"Stop","prompt_id":"%s","stop_hook_active":false,"transcript_path":"%s"}' "$sid" "$pid" "$trp")
+  LAST_OUT=$(printf '%s' "$LAST_IN" | $PY .githooks/require_signoff.py 2>&1); LAST_RC=$?; return $LAST_RC
+}
+hook_stop() {  # sid prompt_id [held=none] [status=done] [next] -> Stop guard, final message ending in a TRUTHFUL terminal block
+  local sid="$1" pid="$2" held="${3:-none}" status="${4:-done}" next="${5:-python scripts/board.py menu}"
+  hook_stop_text "$sid" "$pid" "$(printf 'work done.\n\nstatus: %s\nheld:   %s\nnext:   %s' "$status" "$held" "$next")"; return $LAST_RC
+}
 commit_as() { local sid="$1"; shift; LAST_OUT=$(CLAUDE_CODE_SESSION_ID="$sid" git commit -q -m "$*" 2>&1); LAST_RC=$?; return $LAST_RC; }
 first_line() { printf '%s' "$1" | grep -m1 -E '\[require_lock\]|\[require_signoff\]|\[lock-guard\]|\[folder-lock\]|LOCKED|AGENT HOLDS|SIGNING OFF|REFUSED|RELEASED|CLAIMED|WIRING|READER|RULES|PARTIAL|READ IN FULL' || printf '%s' "$1" | head -1; }
 record() { local n="$1" ok="$2" name="$3" line; line="$(first_line "$LAST_OUT")"; RESULTS+=("$n|$([ "$ok" = 1 ] && echo PASS || echo FAIL)|$name|$line"); log "$([ "$ok" = 1 ] && echo PASS || echo FAIL)  $n. $name"; log "      -> ${line:0:220}"; }
@@ -74,11 +91,11 @@ section "6. Closing lock, pointer not updated, stop -> Stop guard blocks with re
 mkdir -p fixture/workflow-state; printf '# ptr\n\nNext concrete action: old\n' > fixture/workflow-state/current-pointer.md
 touch -d "2 hours ago" fixture/workflow-state/current-pointer.md
 CLAUDE_CODE_SESSION_ID=sess-a $LOCK close fixture >>"$TR" 2>&1
-hook_stop sess-a p6; ok=0; [ $LAST_RC -ne 0 ] && grep -q "before the lock start" <<<"$LAST_OUT" && ok=1
+hook_stop sess-a p6 fixture; ok=0; [ $LAST_RC -ne 0 ] && grep -q "before the lock start" <<<"$LAST_OUT" && ok=1
 record 6 $ok "Stop with closing lock + stale pointer -> blocked: pointer not updated"; show_io
 
 section "7. Open lock, pointer not updated, stop -> passes"
-CLAUDE_CODE_SESSION_ID=sess-a $LOCK reopen fixture >>"$TR" 2>&1; hook_stop sess-a p7; ok=0; [ $LAST_RC -eq 0 ] && ok=1
+CLAUDE_CODE_SESSION_ID=sess-a $LOCK reopen fixture >>"$TR" 2>&1; hook_stop sess-a p7 fixture; ok=0; [ $LAST_RC -eq 0 ] && ok=1
 record 7 $ok "Stop with open lock -> passes"
 
 section "8. Closing, pointer updated, committed, released -> Stop passes"
@@ -224,7 +241,7 @@ o21a=$(CLAUDE_CODE_SESSION_ID=sess-r $LOCK reader --hint menu 2>&1); r21a=$?
 o21w=$(CLAUDE_CODE_SESSION_ID=sess-r $LOCK whoami 2>&1); r21w=$?
 hook_edit sess-r fixture/f.txt; r21b=$LAST_RC; o21b="$LAST_OUT"
 hook_stop sess-r p21; r21c=$LAST_RC; o21c="$LAST_OUT"
-GL="$FLSTATE/guard_log.jsonl"; n21c=$(grep -c "reader identity menu-.*nothing to sign off" "$GL" 2>/dev/null || echo 0)
+GL="$FLSTATE/guard_log.jsonl"; n21c=$(grep -c '"session_id": "sess-r".*"state": "unclaimed".*"decision": "pass".*terminal block ok' "$GL" 2>/dev/null | tail -1); n21c=${n21c:-0}
 o21d=$(CLAUDE_CODE_SESSION_ID=sess-r $LOCK claim fixture --task "R claims fixture after browsing" --hint window-r 2>&1); r21d=$?
 WIN_R=$(CLAUDE_CODE_SESSION_ID=sess-r $LOCK whoami | sed -n 's/^window=\([^ ]*\).*/\1/p')
 ok=0; [ $r21a -eq 0 ] && grep -q "^READER menu-" <<<"$o21a" && grep -q "^READER menu-" <<<"$o21w" \
@@ -271,7 +288,100 @@ LAST_OUT="claim from worktree: exit $r24a ($(first_line "$o24a" | cut -c1-50)); 
 record 24 $ok "lock tree: worktree agent claims -> LOCK.yaml in the canonical tree only; canonical check LOCKED; handoff note lands in the lock tree (lock_rel path); release from the worktree deletes it"
 git worktree remove --force "$WT" >>"$TR" 2>&1 || true
 
+# ================================================================ §17 session lifecycle — acceptance 1–7 (v5.0)
+NEW="$PY _skill/scripts/new.py"; SIGNOFF="$PY _skill/scripts/signoff.py"
+git add .folder-lock/registry.yaml 2>/dev/null; ICM_LOCK_BYPASS=1 MAIN_COMMIT_OK=1 git commit -q -m "registry tracked (setup)" >/dev/null 2>&1
+
+section "25. [acceptance 1] UNCLAIMED session ends WITHOUT the block -> Stop blocks; signoff.py --held none prints held: none; Stop with that block passes; untruthful held: blocked"
+hook_stop_text sess-t25 p25a "all done, closing the window."; r25a=$LAST_RC; o25a="$LAST_OUT"
+o25b=$(CLAUDE_CODE_SESSION_ID=sess-t25 $SIGNOFF --held none --decisions "browsing only, nothing claimed" 2>&1); r25b=$?
+BLK25=$(printf '%s\n' "$o25b" | tail -3)
+hook_stop_text sess-t25 p25b "$(printf 'summary of the session.\n\n%s' "$BLK25")"; r25c=$LAST_RC
+hook_stop_text sess-t25 p25c "$(printf 'lying about the lock.\n\nstatus: done\nheld:   fixture\nnext:   x')"; r25d=$LAST_RC; o25d="$LAST_OUT"
+ok=0; [ $r25a -ne 0 ] && grep -q "every session ends with a terminal block" <<<"$o25a" && [ $r25b -eq 0 ] && grep -q "^held:   none" <<<"$o25b" \
+  && [ $r25c -eq 0 ] && [ $r25d -ne 0 ] && grep -q "holds no fresh lock" <<<"$o25d" && ok=1
+LAST_OUT="no block: exit $r25a | signoff --held none: exit $r25b, block: $(printf '%s' "$BLK25" | tr '\n' '|') | Stop with block: exit $r25c | Stop claiming held: fixture: exit $r25d"
+record 25 $ok "terminal block: missing -> blocked; signoff.py --held none -> held: none; truthful block passes; untruthful held: blocked"
+
+section "26. [acceptance 2] blank window: SessionStart binds a fresh reader window + forces the triage; a Write before any claim -> denied"
+o26a=$(printf '{"session_id":"sess-t26","hook_event_name":"SessionStart","source":"startup"}' | CLAUDE_CODE_SESSION_ID=sess-t26 $PY .githooks/session_start.py 2>&1); r26a=$?
+hook_edit sess-t26 fixture/f.txt; r26b=$LAST_RC; o26b="$LAST_OUT"
+o26w=$(CLAUDE_CODE_SESSION_ID=sess-t26 $LOCK whoami 2>&1)
+ok=0; [ $r26a -eq 0 ] && grep -q "FIRST ACTION — TRIAGE" <<<"$o26a" && grep -q "window fresh-" <<<"$o26a" && grep -q "new.py <slug>" <<<"$o26a" \
+  && grep -q "^READER fresh-" <<<"$o26w" && [ $r26b -ne 0 ] && grep -q "reader identity" <<<"$o26b" && ok=1
+LAST_OUT="SessionStart: triage present, $(grep -o 'window fresh-[a-z0-9-]*' <<<"$o26a" | head -1) | whoami: $(first_line "$o26w" | cut -c1-40) | Edit before claim: exit $r26b"
+record 26 $ok "blank window: SessionStart -> fresh reader window + triage prompt; Edit before a claim denied"
+
+section "27. [acceptance 3] new.py test-lane -> folder + 4 files, registry entry (non-overlapping), lock held, board item, one commit; overlap + duplicate refused"
+o27=$(CLAUDE_CODE_SESSION_ID=sess-t27 $NEW test-lane --goal "prove the lifecycle end to end: scaffold, register, claim, archive, unarchive" 2>&1); r27=$?; log "$o27"
+o27c=$(CLAUDE_CODE_SESSION_ID=sess-t27 $LOCK check test-lane 2>&1)
+o27i=$(CLAUDE_CODE_SESSION_ID=sess-t27 $PY _skill/lib/items.py list --owner test-lane 2>&1)
+o27r=$($PY -c "import sys; sys.path.insert(0,'_skill/lib'); import lockpath as lp; r=lp.resolve('test-lane/memory.md'); print(r.kind, r.folder, r.workflow)" 2>&1)
+o27o=$(CLAUDE_CODE_SESSION_ID=sess-t27x $NEW sub --at fixture --goal overlap 2>&1); r27o=$?
+o27d=$(CLAUDE_CODE_SESSION_ID=sess-t27x $NEW test-lane --goal dup 2>&1); r27d=$?
+ok=0; [ $r27 -eq 0 ] && [ -f test-lane/.goal/goal.md ] && [ -f test-lane/memory.md ] && [ -f test-lane/progress.md ] && [ -f test-lane/workflow-state/current-pointer.md ] \
+  && [ -f test-lane/.goal/LOCK.yaml ] && grep -q "^- id: test-lane" .folder-lock/registry.yaml && grep -q "^registry test-lane test-lane" <<<"$o27r" \
+  && grep -q "^YOURS test-lane" <<<"$o27c" && grep -q "test-lane|pointer" <<<"$o27i" && git log -1 --format=%s | grep -q "test-lane: new workfolder" \
+  && [ -z "$(git status --porcelain -- test-lane)" ] && [ $r27o -eq 3 ] && grep -q "overlaps" <<<"$o27o" && [ ! -d fixture/sub ] && [ $r27d -eq 3 ] \
+  && grep -q "^status: done" <<<"$o27" && grep -q "^held:   test-lane" <<<"$o27" && ok=1
+LAST_OUT="new: exit $r27, files 4/4, $(first_line "$o27c" | cut -c1-30), commit '$(git log -1 --format=%s | cut -c1-40)' | resolver: $o27r | overlap: exit $r27o | duplicate: exit $r27d"
+record 27 $ok "new.py test-lane: scaffolded, registered (resolver agrees), claimed, on the board, committed; overlap + duplicate refused"
+
+section "28. [acceptance 4] goal complete + 0 open items -> signoff archives: git mv -> _archive/test-lane, registry archived: true, released, off the board, claim refused (7)"
+sed -i 's/^complete: false/complete: true/' test-lane/.goal/goal.md
+printf '# Current pointer — test-lane\n\nNext concrete action: NONE — lifecycle proven; folder closes.\n' > test-lane/workflow-state/current-pointer.md
+git add test-lane/workflow-state/current-pointer.md && CLAUDE_CODE_SESSION_ID=sess-t27 git commit -q -m "test-lane: pointer NONE (closing)" >>"$TR" 2>&1
+o28=$(CLAUDE_CODE_SESSION_ID=sess-t27 $SIGNOFF --decisions none --no-kick 2>&1); r28=$?; log "$o28"
+o28b=$($PY _skill/scripts/board.py json --no-touch 2>/dev/null | grep -c '"folder": "test-lane"')
+o28c=$(CLAUDE_CODE_SESSION_ID=sess-t28 $LOCK check _archive/test-lane 2>&1)
+o28d=$(CLAUDE_CODE_SESSION_ID=sess-t28 $LOCK claim _archive/test-lane --task "must be refused" 2>&1); r28d=$?
+REGBLK=$($PY -c "import sys; sys.path.insert(0,'_skill/lib'); import lifecycle as lc; print(lc.registry_blocks(open('.folder-lock/registry.yaml',encoding='utf-8').read()).get('test-lane',''))")
+ok=0; [ $r28 -eq 0 ] && [ -d _archive/test-lane ] && [ ! -d test-lane ] && [ -f _archive/test-lane/memory.md ] && [ -f _archive/test-lane/progress.md ] \
+  && grep -q "_archive/test-lane/\*\*" <<<"$REGBLK" && grep -q "archived: true" <<<"$REGBLK" && [ "$o28b" = "0" ] && grep -q "^FREE _archive/test-lane" <<<"$o28c" \
+  && [ $r28d -eq 7 ] && grep -q "ARCHIVED" <<<"$o28d" && grep -q "^status: done" <<<"$o28" && grep -q "^held:   none" <<<"$o28" \
+  && git log -1 --format=%s | grep -q "archived via" && [ -z "$(git status --porcelain -- _archive/test-lane test-lane)" ] && ok=1
+LAST_OUT="signoff: exit $r28 | registry: $(grep -o 'archived: true' <<<"$REGBLK" | head -1), owns $(grep -o '_archive/test-lane/\*\*' <<<"$REGBLK" | head -1) | board rows for test-lane: $o28b | check: $(first_line "$o28c" | cut -c1-30) | claim: exit $r28d"
+record 28 $ok "archive flow: complete: true + 0 items -> _archive/test-lane, registry archived, released, off the board, claim refused (7); memory.md + progress.md intact"
+
+section "29. [acceptance 5] new.py test-lane again -> OFFERS unarchive (exit 6), no duplicate; --unarchive restores folder + registry + claim"
+o29a=$(CLAUDE_CODE_SESSION_ID=sess-t29 $NEW test-lane --goal "second attempt" 2>&1); r29a=$?
+NODUP29=0; [ ! -d test-lane ] && NODUP29=1
+o29b=$(CLAUDE_CODE_SESSION_ID=sess-t29 $NEW test-lane --unarchive 2>&1); r29b=$?; log "$o29b"
+o29c=$(CLAUDE_CODE_SESSION_ID=sess-t29 $LOCK check test-lane 2>&1)
+REGBLK=$($PY -c "import sys; sys.path.insert(0,'_skill/lib'); import lifecycle as lc; print(lc.registry_blocks(open('.folder-lock/registry.yaml',encoding='utf-8').read()).get('test-lane',''))")
+ok=0; [ $r29a -eq 6 ] && grep -q "ARCHIVED test-lane exists at _archive/test-lane" <<<"$o29a" && [ "$NODUP29" = 1 ] \
+  && [ $r29b -eq 0 ] && [ -d test-lane ] && [ ! -d _archive/test-lane ] && [ -f test-lane/memory.md ] && grep -q "^  - test-lane/\*\*" <<<"$REGBLK" && ! grep -q "archived: true" <<<"$REGBLK" \
+  && grep -q "^YOURS test-lane" <<<"$o29c" && git log -1 --format=%s | grep -q "unarchived via" && ok=1
+LAST_OUT="second new.py: exit $r29a (no duplicate: $NODUP29) | --unarchive: exit $r29b, $(first_line "$o29c" | cut -c1-30), registry owns test-lane/** again, archived flag gone"
+record 29 $ok "new.py on an archived slug offers unarchive (6), no duplicate; --unarchive restores path, registry glob, lock"
+
+section "30. [acceptance 6] holding test-lane: Edit into other/ -> denied naming the held folder + handoff.py; shell 'echo > other/o.txt' -> denied; own folder / drop zone / outside repo pass"
+hook_edit sess-t29 other/o.txt; r30a=$LAST_RC; o30a="$LAST_OUT"
+o30b=$(printf '{"session_id":"sess-t29","tool_name":"Bash","cwd":"%s","tool_input":{"command":"echo x > other/o.txt"}}' "$FXP" | $PY .githooks/require_write_scope.py 2>&1); r30b=$?
+o30c=$(printf '{"session_id":"sess-t29","tool_name":"Bash","cwd":"%s","tool_input":{"command":"echo note >> test-lane/progress.md && git status"}}' "$FXP" | $PY .githooks/require_write_scope.py 2>&1); r30c=$?
+o30d=$(printf '{"session_id":"sess-t29","tool_name":"PowerShell","cwd":"%s","tool_input":{"command":"Set-Content -Path _inbox/drop30/note.md -Value 1"}}' "$FXP" | $PY .githooks/require_write_scope.py 2>&1); r30d=$?
+o30e=$(printf '{"session_id":"sess-t29","tool_name":"Bash","cwd":"%s","tool_input":{"command":"python x.py 2>/dev/null | tee /tmp/outside.log"}}' "$FXP" | $PY .githooks/require_write_scope.py 2>&1); r30e=$?
+ok=0; [ $r30a -ne 0 ] && grep -q "handoff.py" <<<"$o30a" && grep -q "you hold: test-lane" <<<"$o30a" && [ $r30b -ne 0 ] && grep -q "handoff.py" <<<"$o30b" \
+  && [ $r30c -eq 0 ] && [ $r30d -eq 0 ] && [ $r30e -eq 0 ] && ok=1
+LAST_OUT="Edit other/o.txt: exit $r30a (handoff.py named, held: $(grep -o 'you hold: [a-z-]*' <<<"$o30a" | head -1)) | shell > other/o.txt: exit $r30b | own folder: exit $r30c | drop zone: exit $r30d | outside repo: exit $r30e"
+record 30 $ok "write scope while holding test-lane: Edit + shell redirection into another folder denied (handoff.py named); own folder, drop zone, outside repo pass"
+CLAUDE_CODE_SESSION_ID=sess-t29 $LOCK release test-lane --allow-dirty "fixture test" >>"$TR" 2>&1
+
+section "31. [acceptance 7] headless (loop-fired) session: SessionStart shows NO triage; Stop still enforces the block (held must be the fired folder; trailing DONE tolerated)"
+printf 'holder: fired\nwindow: "fired-agent-260911-t31x"\nstatus: open\ntask: "autorun fixture"\nstream: "fixture"\nbranch: "main"\nstarted: "%s"\n' "$(date +%Y-%m-%dT%H:%M)" > fixture/.goal/.firing.lock
+o31a=$(printf '{"session_id":"sess-t31","hook_event_name":"SessionStart","source":"startup"}' | ICM_WINDOW=fired-agent-260911-t31x ICM_FOLDER=fixture $PY .githooks/session_start.py 2>&1); r31a=$?
+ICM_WINDOW=fired-agent-260911-t31x ICM_FOLDER=fixture hook_stop_text sess-t31 p31a "$(printf 'item worked.\nDONE')"; r31b=$LAST_RC; o31b="$LAST_OUT"
+ICM_WINDOW=fired-agent-260911-t31x ICM_FOLDER=fixture hook_stop_text sess-t31 p31b "$(printf 'item worked.\n\nstatus: done\nheld:   none\nnext:   x\nDONE')"; r31c=$LAST_RC; o31c="$LAST_OUT"
+ICM_WINDOW=fired-agent-260911-t31x ICM_FOLDER=fixture hook_stop_text sess-t31 p31c "$(printf 'item worked.\n\nstatus: done\nheld:   fixture\nnext:   python scripts/signoff.py\nDONE')"; r31d=$LAST_RC
+ok=0; [ $r31a -eq 0 ] && grep -q "HEADLESS AGENT fired-agent-260911-t31x: no triage" <<<"$o31a" && ! grep -q "FIRST ACTION — TRIAGE" <<<"$o31a" \
+  && [ $r31b -ne 0 ] && grep -q "every session ends with a terminal block" <<<"$o31b" && [ $r31c -ne 0 ] && grep -q "still holds fixture" <<<"$o31c" && [ $r31d -eq 0 ] && ok=1
+LAST_OUT="SessionStart: headless line present, triage absent | Stop 'DONE' only: exit $r31b | Stop held: none while .firing.lock fresh: exit $r31c | Stop held: fixture + DONE: exit $r31d"
+record 31 $ok "headless agent: no triage prompt; Stop blocks without the block and on an untruthful held:, passes with held: fixture + the DONE line"
+rm -f fixture/.goal/.firing.lock
+
+
 cd "$SK"; rm -rf "$TMP"
+
 section "summary"; ALL=1
 for r in "${RESULTS[@]}"; do IFS='|' read -r n ok name line <<<"$r"; log "$ok  $n. $name"; [ "$ok" = PASS ] || ALL=0; done
 $PY - "$OUTDIR/conflict_last.json" "$ALL" "${RESULTS[@]}" <<'PYEOF'

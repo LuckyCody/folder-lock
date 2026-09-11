@@ -37,7 +37,7 @@ import statestore  # noqa: E402
 
 statestore.READONLY = True   # §14: a render never writes state; touch flips it for the ONE seen-stamp write
 
-SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".next", "dist", "build", ".githooks"}
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".next", "dist", "build", ".githooks", "_archive"}   # archived folders are never on the board (§17)
 WIDTH = 110
 SIGNPOST_TRACKED = lp.ROOT / ".folder-lock" / "next-session.md"
 

@@ -42,6 +42,12 @@ def staged_paths(repo: Path) -> list:
     return [p for p in out.split("\0") if p]
 
 
+def staged_deletions(repo: Path) -> list:
+    out = subprocess.run(["git", "diff", "--cached", "--name-only", "--diff-filter=D", "-z"], cwd=repo,
+                         capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
+    return [p for p in out.split("\0") if p]
+
+
 def verify_wiring(repo: Path) -> str:
     hooks_dir = _git("rev-parse", "--git-path", "hooks", cwd=repo)
     if not hooks_dir:
@@ -128,31 +134,32 @@ def guard(repo: Path) -> int:
         print(f"[lock-guard] REFUSED — registry unreadable: {e}")
         return 1
     problems: dict = {}
-    cache: dict = {}
-    for rel in staged_paths(repo):
-        res = lp.resolve(rel, flows)
-        if res.kind == "unguarded":
-            problems.setdefault(f"UNGUARDED {res.folder}", []).append(rel)
+    staged = staged_paths(repo)
+    sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    import lifecycle as lc
+    try:
+        registry_rel = lp.REGISTRY.resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        registry_rel = ".folder-lock/registry.yaml"
+    registry_own = None
+    if registry_rel in staged:
+        # §17: new.py and the archive flow write registry entries for folders THEY hold — that change is the committer's
+        # own even though the registry file resolves to another lock (lifecycle.registry_change_is_own). The homes it
+        # returns cover the folder MOVE that goes with it: staged deletions under a home that left the disk.
+        registry_own = lc.registry_change_is_own(repo, me, sid, registry_rel)
+        print(f"[lock-guard] registry: {'own change — ' + registry_own[1] if registry_own[0] else 'NOT an own change (' + registry_own[1] + ') — lock rule applies'}")
+    moved_homes = set(registry_own[2]) if registry_own and registry_own[0] else set()
+    deleted = set(staged_deletions(repo))
+    for rel in staged:
+        if rel == registry_rel and registry_own and registry_own[0]:
             continue
-        if lp.is_whitelisted(rel, res, me):
+        if rel in deleted and any(rel == h or rel.startswith(h + "/") for h in moved_homes):
+            continue   # the old path of an archived / unarchived folder — part of the own registry move
+        # ONE verdict function for the edit guard, the shell guard and this commit guard (§17)
+        ok, why, code = lc.write_verdict(rel, me, sid, mode="commit", flows=flows)
+        if ok:
             continue
-        key = str(res.lock_dir)
-        if key not in cache:
-            cache[key] = lp.locks_at(res.lock_dir)
-        locks = cache[key]
-        mine = [li for li in locks if lp.same_window(li.window, me.window) and li.fresh]
-        foreign = [li for li in locks if not lp.same_window(li.window, me.window) and (li.fresh or li.malformed)]
-        lit = lp.literal_lock(rel, res)
-        if lit is not None:  # v4.1: a fresh LOCK.yaml at the folder itself (registry moved the folder after the claim)
-            if lp.same_window(lit.window, me.window):
-                continue
-            lit_folder = lit.path.parent.parent.relative_to(lp.ROOT).as_posix()
-            problems.setdefault(f"FOREIGN {lit_folder} (literal lock): {lit.describe()}", []).append(rel)
-            continue
-        if foreign:
-            problems.setdefault(f"FOREIGN {res.folder or '<root>'}: {foreign[0].describe()}", []).append(rel)
-        elif not mine:
-            problems.setdefault(f"UNCLAIMED {res.folder or '<root>'}: no fresh lock of yours ({me.window}) — claim first", []).append(rel)
+        problems.setdefault(f"{code} {why.split(' — ')[0][:140]}", []).append(rel)
     if not problems:
         warns = deploy_unit_warnings(staged_paths(repo), me)
         for w in warns:

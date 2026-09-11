@@ -156,6 +156,7 @@ class Workflow:
     id: str
     globs: list
     home: Optional[str]
+    archived: bool = False  # `archived: true` (§17): the folder lives under _archive/, is never claimed, never on the board
 
 
 def _fixed_prefix(glob: str) -> str:
@@ -191,6 +192,10 @@ def load_registry() -> list:
         m = re.match(r"^\s+owns:\s*\[(.*)\]\s*$", line)   # inline list form
         if m:
             cur.globs += [g.strip().strip("'\"") for g in m.group(1).split(",") if g.strip()]
+            continue
+        if re.match(r"^\s+archived:\s*(true|yes)\s*$", line, re.I):
+            cur.archived = True
+            in_owns = False
             continue
         if re.match(r"^\s+owns:\s*$", line):
             in_owns = True

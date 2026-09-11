@@ -1,5 +1,7 @@
 # folder-lock — many agents, one repo, no conflicting saves
 
+**v5.0.0** — the session lifecycle becomes a mechanism: every session is `unclaimed → claimed(<folder>) → signed-off`, every session ends through the signoff (also one that held nothing), and every final reply ends with a three-line **terminal block** (`status / held / next`) that the Stop hook reads from the transcript and checks against the locks on disk. A SessionStart hook bootstraps blank windows (fresh reader identity, the invariants, a forced triage: continuation → board + claim, new work → `scripts/new.py <slug>`), one verdict function (`lib/lifecycle.py`) drives the edit guard, a new shell write-scope guard and the commit guard, `new.py` scaffolds + registers + claims + lists a folder in one step, and `signoff.py` computes `status:`/`next:` from the board and **archives** finished folders (`_archive/<slug>/`, registry `archived: true`) — nothing is ever deleted. Conflict test 31/31. See [What's new in v5](#whats-new-in-v5).
+
 **v4.2.0** — runtime state leaves the working tree: a host-local state root (`%LOCALAPPDATA%\folder-lock\<repo-hash>`) for bindings, guard logs and self-test records, and `lib/statestore.py` for the coordination documents (items, inbox index, digest window) with conditional ETag writes, per-record merge on a lost race, cache + outbox when offline — file backend by default, Azure Blob optional. Plus three proofs before trusting the disk (sync conflict copies gate the claim, rules-set bytes are compared across hosts, a PostToolUse hook proves a pointer was read in full), a lock-holder view (`lock.py who` names the peer to message), a reader identity for menu-only sessions, `board.py menu` as the §13 exit gate, conflict test 21/21. See [What's new in v4.2](#whats-new-in-v42).
 
 **v4.1.0** — the handoff ledger moves to an append-only sidecar (the binding YAML is identity only), `lock.py consume` records a handoff you staged and then did yourself, literal locks survive a registry remap ("the closest existing lock wins"), consumed placeholder notes leave the board, conflict test 14/14. See [What's new in v4.1](#whats-new-in-v41).
@@ -54,7 +56,9 @@ git add <your paths> && git commit -m "..."                # identity comes from
 python scripts/lock.py close finance/payroll               # task done -> closing; Stop hook now insists on the rest
 #     write finance/payroll/workflow-state/current-pointer.md, commit
 python scripts/deploy_request.py --for finance/payroll     # v3: request the deploy — the single deployer ships HEAD (§11)
-python scripts/lock.py release finance/payroll             # verifies pointer, tree, handoffs; deletes the lock
+python scripts/signoff.py                                  # v5: from-pointer, status/next from the board, archive decision, release, the terminal block
+# (a session that claimed nothing: python scripts/signoff.py --held none — every session ends here)
+python scripts/new.py store-ops/kiosk --goal "..."          # v5: NEW work = scaffold + registry entry + claim + board item, one step
 ```
 
 Inside Claude Code no env var is needed: `claim` binds the minted window to `CLAUDE_CODE_SESSION_ID`, which the Bash tool exposes and hooks receive as `session_id`. Plain terminals and headless agents set `ICM_WINDOW=<window>`.
@@ -66,7 +70,9 @@ Inside Claude Code no env var is needed: `claim` binds the minted window to `CLA
 | `require_lock.py` (PreToolUse) | editing without a lock, under someone else's lock, in a folder with no `.goal/` — before files tangle |
 | `check_locks.py` (pre-commit) | staged paths under another window's lock, unclaimed/unguarded folders, `git add -A` sweeps, missing identity, a hook that is not actually wired |
 | `protect_main.py` (pre-commit) | plain commits on `main`/`master` |
-| `require_signoff.py` (Stop) | ending a turn holding a `closing` lock with the pointer stale or the lock not released (a session with no identity is browsing and passes) |
+| `require_signoff.py` (Stop) | a final message without the terminal block (`status / held / next`), a `held:` that disagrees with the locks on disk, a `closing` lock with the pointer stale or the lock not released (v5) |
+| `require_write_scope.py` (PreToolUse on Bash/PowerShell) | shell redirections (`>`, `>>`, `tee`, `Out-File`, `Set-Content`) outside the held folder — the same verdict as the edit guard (v5) |
+| `session_start.py` (SessionStart) | a blank window without rules: binds a fresh reader window, states the invariants, forces the triage (v5) |
 | `check_pointer_read.py` (PostToolUse on Read) | a sliced read of a pointer / inbox note / rules file presented as complete — injects `READ IN FULL ✓` or `PARTIAL READ ⚠` + the action line verbatim |
 | `lock.py claim` gate (§15) | divergent sync conflict copies of load-bearing files (refuses, exit 5), rules-byte drift across hosts (reported) |
 
@@ -83,6 +89,24 @@ workflows:
   - finance/payroll/**
   - .claude/skills/payroll/**        # locks at finance/payroll/.goal — one lock per workflow home
 ```
+
+## What's new in v5
+
+The lifecycle used to be a convention: a session that held no lock could end with "nothing is held" (a lock state, not a session end), and a session opened in a blank window had no rules until the commit guard caught it. v5 makes both mechanical (PROTOCOL §17).
+
+- **Terminal block** (`hooks/require_signoff.py`, `lib/lifecycle.parse_terminal_block`): the final message of every turn must END with
+  ```
+  status: done | blocked | handed-off
+  held:   <folder> | none
+  next:   <exact command> | none — waiting on the owner
+  ```
+  read from the transcript (`transcript_path`), `held:` checked against the locks on disk (`none` while your lock is fresh → blocked; a folder you do not hold → blocked). Missing → `run the signoff — every session ends with a terminal block`. Idempotent (a truthful block passes), at most two blocks per prompt, headless agents included — they may follow the block with their `DONE | WAITING_OWNER | FAILED: …` line.
+- **SessionStart bootstrap** (`hooks/session_start.py`): from the repo root, binds a fresh reader window when the session has none, states the invariants, forces the triage as the first action (continuation → `board.py menu` + `lock.py claim`; new work → `new.py <slug>`), and points a headless agent (ICM_WINDOW + ICM_FOLDER in env) straight at its folder with no triage. `install.py --claude-hooks` wires it (`SessionStart`, matcher `startup|clear`).
+- **One verdict function** (`lib/lifecycle.write_verdict` → `(allow, reason, code)`): the edit guard, the new **shell write-scope guard** (`hooks/require_write_scope.py`, PreToolUse on Bash|PowerShell: `>`, `>>`, `tee`, `Out-File`, `Set-Content`, `Add-Content`) and the commit guard all call it, so they cannot disagree. Rule: writes only inside the held folder; exceptions `_inbox/` drops (`FOLDER_LOCK_INBOX`) and `workflow-state/` (unless the folder is held by another window); with no lock nothing but the drop zone; `_archive/**` read-only; unguarded folders → `new.py`. Denials name YOUR held folder and `handoff.py`.
+- **`scripts/new.py <slug>`**: scaffold from `templates/workfolder/` (`.goal/goal.md` with `complete: false`, `memory.md`, `progress.md`, `workflow-state/current-pointer.md`), append the `owns:` entry to `.folder-lock/registry.yaml` (overlap-checked, created if the repo had none), claim, board item, one commit. The registry entry is staged **index-only** (HEAD text + this entry) so a foreign uncommitted registry edit is never swept; the commit guard accepts a registry change whose entries' homes the committer holds (`lifecycle.registry_change_is_own`). An archived slug is OFFERED for `--unarchive` (exit 6), never duplicated.
+- **`scripts/signoff.py`**: the signoff tail as one script — `items.py from-pointer`, `status:`/`next:` from the board, the **archive decision** (`.goal/goal.md` `complete: true` AND zero open items → `git mv <folder> _archive/<slug>`, registry rewritten + `archived: true`, items done, one commit; the lock travels and is released at the new path), `lock.py release`, the autorun-log line, `board.py --signpost`, then it prints the block. `--held none` for a session that claimed nothing: one log line (+ a session note under the pointer's H1 when the folder is free) and the block. Archived folders are never claimed (`lock.py claim` exit 7) and never on the board.
+- **Registry**: `archived: true` on an entry (`lib/lockpath.Workflow.archived`); `python lib/lifecycle.py audit-registry` lists workfolders without an `owns:` entry (report only).
+- **Tests**: `tests/conflict_run.sh` scenarios 25–31 — the seven acceptance tests (terminal block, blank window, new.py, archive, unarchive, write scope, headless agent); the Stop-hook scenarios now feed a fixture transcript. 31/31.
 
 ## What's new in v4.3
 

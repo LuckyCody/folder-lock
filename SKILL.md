@@ -24,7 +24,7 @@ Read `PROTOCOL.md` once; it is one page and it is the contract. This file tells 
 3. Read `<folder>/workflow-state/current-pointer.md` and `<folder>/.goal/inbox/*.staged.md` **in full** — the claim printed the pointer's size, sha256 and its action line; the PostToolUse hook answers every Read with `READ IN FULL ✓` or `PARTIAL READ ⚠` (PROTOCOL §15). Never report a file's state after a ⚠ line. Start at `Next concrete action:`. If the claim printed `FIRST ACT … fold:`, fold that conflict copy before anything else.
 4. A pre-guard hand-written lock that is yours: `python <skill>/scripts/lock.py adopt <folder>`.
 
-Fresh window, nothing claimed: `python <skill>/scripts/board.py menu` first (it is the §13 gate: with ready items it shows the digest, what waits on the owner and who holds what; with none, the full board), then claim or drop. A menu-only session is a browsing session — the Stop hook lets it end; it gets a reader identity, never a lock.
+**Fresh window, nothing claimed (v5, PROTOCOL §17): the SessionStart hook has already printed your state and the TRIAGE — do it before any other tool use.** Continuation → `python <skill>/scripts/board.py menu` first (it is the §13 gate: with ready items it shows the digest, what waits on the owner and who holds what; with none, the full board), then claim. New work → `python <skill>/scripts/new.py <slug> --goal "..."` (scaffold + registry entry + claim + board item in one step; an archived slug is offered for `--unarchive`, never duplicated). A menu-only session is a browsing session — it gets a reader identity, never a lock, and it STILL ends through `python <skill>/scripts/signoff.py --held none` + the terminal block (the Stop hook blocks the turn otherwise).
 
 ## While working
 
@@ -44,7 +44,13 @@ Run it when **any** of: the lock's task is complete · the owner signals done ("
 2. Write `<folder>/workflow-state/current-pointer.md` with a typed `Next concrete action:` (PROTOCOL §3).
 3. Commit your own paths. Any handoff you wrote must exist, be registered, and be committed if tracked. If the guard prints `WARN (PROTOCOL §11)`, run the named `python <skill>/scripts/test_unit.py <unit>` first — HEAD must stay deployable.
 3b. **Request the deploy, never run it** (PROTOCOL §11): `python <skill>/scripts/deploy_request.py --for <folder>`. If the folder is in a deploy unit (`.folder-lock/deploy-units.yaml`) this drops a request the single deployer collapses with everyone else's and ships as one deploy of HEAD; the result lands in `<folder>/workflow-state/deploys.jsonl`, a failure shows on the board. Outside every unit it prints "no deploy unit covers" and exits 0 — run it unconditionally.
-4. `python <skill>/scripts/lock.py release <folder>` — it verifies pointer mtime, working tree and handoffs, then deletes the lock. A refusal lists what is missing; fix it, don't force it.
+4. `python <skill>/scripts/signoff.py --decisions "<defaults you decided, or none>"` (v5) — from-pointer, `status:`/`next:` from the board, the archive decision (`.goal/goal.md` `complete: true` + 0 open items → `_archive/<slug>/`, registry `archived: true`; never a delete), `lock.py release` (pointer mtime, working tree, handoffs — a refusal is printed verbatim and NO block is printed: the turn may not end), the autorun-log line, `board.py --signpost`. It ends by printing the **terminal block** — paste it as the LAST three lines of your reply:
+   ```
+   status: done | blocked | handed-off
+   held:   <folder> | none
+   next:   <exact command> | none — waiting on the owner
+   ```
+   The Stop hook reads it from the transcript and checks `held:` against the locks on disk. A session that claimed nothing runs `signoff.py --held none` — "nothing is held" is a lock state, not a session end.
 
 ## After release — hand the next step to the loop (v4, PROTOCOL §13)
 
@@ -62,7 +68,7 @@ Do not render the owner's menu and do not start another item in this session: th
 python <skill>/scripts/install.py [<repo>] --claude-hooks
 ```
 
-Copies `hooks/*` + `lib/*` to `<repo>/.githooks/`, sets `core.hooksPath`, gitignores `**/.goal/`, merges the PreToolUse (edit guard + destructive-git guard) + Stop + PostToolUse(Read) hooks into `.claude/settings.json` (omit the flag to just print the JSON), then **runs `check_locks.py --self-test`** (7 cases). Install is not done until it says PASS. Re-run in every clone and worktree. Runtime state (bindings, guard log, the state store) lives in `%LOCALAPPDATA%\folder-lock\<repo-hash>` or `FOLDER_LOCK_STATE_ROOT` — never in the tree (PROTOCOL §14); a repo upgraded from ≤4.1 runs `python <skill>/lib/statestore.py migrate --purge` once. When the owner asks "does the hook actually work": `python <skill>/scripts/selftest.py` and `bash <skill>/tests/conflict_run.sh` (24 scenarios, real refusals, hook stdin/stdout for 1, 6, 9) — paste the result, never answer from the fact that the file exists.
+Copies `hooks/*` + `lib/*` to `<repo>/.githooks/`, sets `core.hooksPath`, gitignores `**/.goal/`, merges the PreToolUse (edit guard + destructive-git guard) + Stop + PostToolUse(Read) hooks into `.claude/settings.json` (omit the flag to just print the JSON), then **runs `check_locks.py --self-test`** (7 cases). Install is not done until it says PASS. Re-run in every clone and worktree. Runtime state (bindings, guard log, the state store) lives in `%LOCALAPPDATA%\folder-lock\<repo-hash>` or `FOLDER_LOCK_STATE_ROOT` — never in the tree (PROTOCOL §14); a repo upgraded from ≤4.1 runs `python <skill>/lib/statestore.py migrate --purge` once. When the owner asks "does the hook actually work": `python <skill>/scripts/selftest.py` and `bash <skill>/tests/conflict_run.sh` (31 scenarios, real refusals, hook stdin/stdout for 1, 6, 9) — paste the result, never answer from the fact that the file exists.
 
 ## Behaviours this skill forbids
 
@@ -70,6 +76,9 @@ Copies `hooks/*` + `lib/*` to `<repo>/.githooks/`, sets `core.hooksPath`, gitign
 - Editing across a folder boundary instead of writing a handoff.
 - Sweeping another stream's in-flight edits into your commit.
 - Deleting `LOCK.yaml` by hand — `lock.py release` is the only exit.
+- Ending a turn without the terminal block, or with a `held:` that lies about the locks (v5).
+- Writing outside the held folder — into another folder, into `_archive/`, or anywhere with no lock held (drop zone excepted); `mkdir`-ing a workfolder by hand instead of `new.py`.
+- Deleting a finished folder — the signoff archives it; `memory.md` is the reason it existed.
 - Waiting for the owner to type "sign off". Ending a turn on a completed task with the lock still `open`.
 - Formatting a window ID, timestamp, or handoff name yourself.
 - Claiming a hook is installed without having tried to break it.
@@ -91,9 +100,15 @@ hooks/check_locks.py         commit guard, fail closed; --self-test, --verify-wi
 hooks/protect_main.py        refuse plain commits on main/master (MAIN_COMMIT_OK=1)
 hooks/require_lock.py        PreToolUse edit guard (Edit/Write/MultiEdit/NotebookEdit)
 hooks/require_safe_git.py    PreToolUse guard on Bash|PowerShell: whole-tree destructive git (clean, stash -u/-a, checkout/restore .) refused in EVERY permission mode (v4.3)
-hooks/require_signoff.py     Stop hook: no ending a turn with a closing lock
+hooks/require_signoff.py     Stop hook: every final message ends with the terminal block (checked against the locks); no ending a turn with a closing lock
+hooks/require_write_scope.py PreToolUse on Bash|PowerShell: shell redirections through the same write verdict as the edit guard (v5)
+hooks/session_start.py       SessionStart: blank-window bootstrap — fresh reader window, invariants, the triage; headless agents get no triage (v5)
+lib/lifecycle.py             §17: session state, terminal block parser, ONE write verdict (edit / shell / commit), registry own-change test, archive helpers
 lib/deployunits.py           deploy units (.folder-lock/deploy-units.yaml): path -> unit, dirty check, test markers
-scripts/lock.py              claim | adopt | close | reopen | release | check | consume | reader | who | whoami | mine | status
+scripts/lock.py              claim (refuses archived folders) | adopt | close | reopen | release | check | consume | reader | who | whoami | mine | status
+scripts/new.py               new workfolder: scaffold + registry entry (index-only staged) + claim + board item + commit; --unarchive restores (v5)
+scripts/signoff.py           the signoff tail: status/next from the board, archive decision, release, autorun-log line, terminal block; --held none (v5)
+templates/workfolder/        goal.md (complete: false|true), memory.md, progress.md, current-pointer.md — what new.py renders
 scripts/handoff.py           stage | fire a task into another folder's .goal inbox (minted names)
 scripts/board.py             menu (the §13 gate) | json | bare full board | --signpost; renders never write
 scripts/deploy_request.py    drop a deploy request (--for <folder> | --unit | --changed) — never deploys
@@ -102,7 +117,7 @@ scripts/test_unit.py         run a unit's tests, leave the per-window marker the
 scripts/deploy_selftest.py   prove the queue: collapse, already-deployed, failure+back-off, dirty-tree block, guard warning
 scripts/install.py           copy hooks+lib, hooksPath, .gitignore, --claude-hooks, self-test
 scripts/selftest.py          commit-guard self-test + protected-branch cases
-tests/conflict_run.sh        24-scenario proof of which guardrail is active where (own throwaway state root + lock tree)
+tests/conflict_run.sh        31-scenario proof of which guardrail is active where (own throwaway state root + lock tree)
 tests/test_v43.py            unit ladder: timed tripwires, resurrected notes, lock tree, globs, credential chain, safe-git verdicts
 tests/autorun_run.py         seeded acceptance run of the loop (own throwaway state root)
 templates/                   LOCK.yaml, current-pointer.md, registry.yaml (per-module + core), deploy-units.yaml
