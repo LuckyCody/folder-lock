@@ -334,21 +334,67 @@ def _verdict(rel: str, me: Optional[lp.Identity], sid: str = "", mode: str = "ed
 # shell redirection targets (Bash / PowerShell PreToolUse)
 # ----------------------------------------------------------------------------
 
-_REDIR_RE = re.compile(
-    r"(?:(?<![\w$&=-])\d?>{1,2}\s*|\btee\s+(?:-a\s+|--append\s+)?|\b(?:Out-File|Set-Content|Add-Content)\b(?:\s+-(?:File|Literal)?Path)?\s+)"
-    r"(?P<q>[\"']?)(?P<path>[^\s\"'|;&<>]+)(?P=q)", re.I)
+_WRITE_OP = (r"(?:(?<![\w$&=:<-])\d?>{1,2}\s*|\btee\s+(?:-a\s+|--append\s+)?"
+             r"|\b(?:Out-File|Set-Content|Add-Content)\b(?:\s+-(?:File|Literal)?Path)?\s+)")
+# a quoted operand may carry spaces (`> 'my file.txt'`, `Out-File "out dir/x.json"`); a bare one ends at shell syntax
+_REDIR_RE = re.compile(_WRITE_OP + r"(?:(?P<q>[\"'])(?P<qpath>[^\"'\n]+)(?P=q)|(?P<path>[^\s\"'|;&<>]+))", re.I)
+_WRITE_OP_TAIL_RE = re.compile(_WRITE_OP + r"$", re.I)
 _SKIP_TARGETS = {"/dev/null", "nul", "$null", "&1", "&2", "/dev/stderr", "/dev/stdout", "-"}
+# a heredoc body (`<<EOF` … `EOF`, quoted or `<<-`) and a PowerShell here-string (`@'` … `'@`) are DATA the command
+# feeds a program — Python with `x > 0`, `f"{v:>9.2f}"`, markdown with `-> file.md` — never redirections of the shell
+_HEREDOC_RE = re.compile(r"<<-?\s*(?P<q>['\"]?)(?P<tag>\w+)(?P=q)[^\n]*\n(?P<body>.*?)^[ \t]*(?P=tag)[ \t]*$", re.M | re.S)
+_PS_HERESTRING_RE = re.compile(r"@(['\"])\r?\n.*?\r?\n\1@", re.S)
+_NOT_A_PATH_CHARS = "(){}[]`,*?"       # brackets/braces/backticks/globs never appear in a real write target
+_PATH_SHAPE_RE = re.compile(r"[\\/~]|^[A-Za-z]:|\.\w{1,12}$")   # a directory separator, a drive, or a file extension
+
+
+def _strip_non_command_text(command: str) -> str:
+    """The command with its DATA blanked out (length-preserving where it matters): heredoc bodies, PowerShell
+    here-strings, and every quoted string that is not itself the operand of a write operator. What is left is
+    the shell's own syntax — the only place a redirection can live (2026-09-14: 85 shell-guard denials in one day,
+    the majority `>` inside Python/regex/prose the command was merely carrying)."""
+    s = command or ""
+    s = _HEREDOC_RE.sub(lambda m: m.group(0)[:m.start("body") - m.start(0)] + m.group("tag"), s)
+    s = _PS_HERESTRING_RE.sub(" ", s)
+    out: list = []
+    recent = ""                                   # the last emitted chars — the look-back for "is this quote an operand?"
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch not in "\"'":
+            out.append(ch)
+            recent = (recent + ch)[-96:]
+            i += 1
+            continue
+        j = s.find(ch, i + 1)
+        while ch == '"' and j != -1 and s[j - 1] == "\\":       # bash: an escaped double quote inside a double-quoted string
+            j = s.find(ch, j + 1)
+        if j == -1:                                                # unbalanced — keep the rest verbatim (best effort)
+            out.append(s[i:])
+            break
+        piece = s[i:j + 1] if _WRITE_OP_TAIL_RE.search(recent) else ch + " " * (j - i - 1) + ch
+        out.append(piece)
+        recent = (recent + piece)[-96:]
+        i = j + 1
+    return "".join(out)
 
 
 def shell_write_targets(command: str) -> list:
     """Paths a shell command redirects or writes into (`>`, `>>`, `tee`, `Out-File`, `Set-Content`, `Add-Content`).
     Best effort — the sanctioned writers (lock.py, handoff.py, items.py) write from Python and are not caught,
-    which is the point; `echo x > <file>` is."""
+    which is the point; `echo x > <file>` is. Operators inside quoted strings, heredocs and here-strings are the
+    command's DATA and never count; a target must have a path shape (separator, drive or extension) and none of
+    the characters a file name written from a shell never carries (brackets, braces, backticks, globs)."""
     out = []
-    for m in _REDIR_RE.finditer(command or ""):
-        p = m.group("path").strip()
-        if not p or p.lower() in _SKIP_TARGETS or p.startswith(("&", "$", "%", "$(", "`")):
-            continue
+    for m in _REDIR_RE.finditer(_strip_non_command_text(command)):
+        p = (m.group("qpath") or m.group("path") or "").strip()
+        if not p or p.lower() in _SKIP_TARGETS or p.startswith(("&", "$", "%", "$(", "`", "-", "=")):
+            continue        # descriptors, variables, flags (`-Encoding`), `>=` comparisons
+        p = p.rstrip(".,:;")                       # prose punctuation glued to a word: `FALLBACK.`, `file.txt,`
+        if not p or any(c in p for c in _NOT_A_PATH_CHARS):
+            continue        # `9.2f}`, `(.*?)`, `x[0]`, `a,b`, `*.pdf` — code, not a file the shell writes
+        if not _PATH_SHAPE_RE.search(p) or re.fullmatch(r"[=\d:.\-T_]+", p):
+            continue        # ICM audit D6: `>=`, `> 20`, `>the`, `2026-09-14T04:52` inside Python/prose are not files
         if p.lower().startswith(("/dev/", "nul:")):
             continue
         if p not in out:
