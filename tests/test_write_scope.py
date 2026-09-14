@@ -7,15 +7,33 @@ merely carried) plus the true positives the guard exists for.
 """
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import lifecycle as lc  # noqa: E402
 
-T = lc.shell_write_targets
+# Never the live store, and never AHEAD of a sibling suite that pins its own throwaway roots at import
+# (test_v43.py): defaults only, and `lockpath` is imported lazily — at the first test, after collection.
+_TMP = Path(tempfile.mkdtemp(prefix="folder-lock-tokenizer-"))
+os.environ.setdefault("FOLDER_LOCK_STATE_ROOT", str(_TMP / "state"))
+os.environ.setdefault("FOLDER_LOCK_STATE_BACKEND", "file")
+os.environ.setdefault("FOLDER_LOCK_LOCK_TREE", str(_TMP / "tree"))
+lc = None
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _load():
+    global lc
+    import lifecycle
+    lc = lifecycle
+
+
+def T(cmd: str) -> list:
+    return lc.shell_write_targets(cmd)
 
 
 # ── true positives: what the guard is for ─────────────────────────────────────────────────────────────────
