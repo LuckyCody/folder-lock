@@ -5,6 +5,12 @@ NOT edit Y (the edit-time guard would refuse anyway). It writes a handoff into Y
 
   python scripts/handoff.py --to <folder> --task "<one line>" [--from <folder>] [--body notes.md | --body -]
   python scripts/handoff.py --to <folder> --task "..." --mode fire      # also writes .goal/state.yaml for a headless runner
+  python scripts/handoff.py --to <folder> --task "..." --type answer    # an OWNER RULING: filed, not fired (v5.2)
+
+`--type` is the caller intent, and it decides what the folder next fire does with the note:
+  task    a handoff to work (default)  |  report  a status note, read not fired  |  answer  an owner ruling on a
+  `waiting_owner` item - written with `status: filed`, so the folder next fire READS it and acts on the ruling
+  instead of being kicked by it. `board.py answer` is the only writer of `answer`.
 
 Names and timestamps are minted (lib/mint.py). The handoff is recorded on this session's
 binding so `scripts/lock.py release` refuses while it is orphaned or unregistered.
@@ -24,6 +30,9 @@ import lockpath as lp  # noqa: E402
 import mint  # noqa: E402
 
 ROOT = lp.ROOT
+
+# The note the last `main()` wrote - `boardmat.answer` reads it to stamp `answer_ref` (v5.2). Process-local.
+LAST_NOTE = None
 
 
 def _yaml_str(s: str) -> str:
@@ -56,13 +65,17 @@ def _register_inbox(target_rel: str) -> None:
     statestore.register_inbox(target_rel)
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    global LAST_NOTE          # boardmat.answer reads it for the item's answer_ref (v5.2) — without this the
+                              # assignment below is a LOCAL and the module-level stays None
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--to", required=True); ap.add_argument("--task", required=True)
     ap.add_argument("--mode", choices=["stage", "fire"], default="stage")
+    ap.add_argument("--type", dest="ntype", choices=["task", "report", "answer"], default="task",
+                    help="what the note IS to the receiving folder: task (work it) | report (read it) | answer (a ruling)")
     ap.add_argument("--from", dest="source", default=""); ap.add_argument("--body", default="")
     ap.add_argument("--force", action="store_true", help="owner-only: bypass the §13 dedup")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     target_rel = a.to.replace("\\", "/").strip("/")
     target = lp.LOCK_TREE / target_rel if target_rel not in ("", ".") else lp.LOCK_TREE   # v4.3: notes live in the lock tree
     target_rel = target_rel or "."
@@ -70,6 +83,9 @@ def main() -> int:
         print(f"ERROR: target folder not found: {target}", file=sys.stderr)
         return 2
     mode = a.mode
+    if a.ntype == "answer" and mode == "fire":
+        print("ERROR: an `answer` is FILED, never fired - drop --mode fire (the folder next fire reads it)", file=sys.stderr)
+        return 3
     if mode == "fire" and is_parked(target):
         print(f"ERROR: {target_rel} is PARKED (owner-suspended) - fire refused. Stage instead.", file=sys.stderr)
         return 3
@@ -89,16 +105,23 @@ def main() -> int:
     inbox.mkdir(parents=True, exist_ok=True)
     note = inbox / f"{mint.handoff(a.task, now)}.{'staged' if mode == 'stage' else 'fired'}.md"
     note.write_text(
-        f"---\nmode: {mode}\ntask: {_yaml_str(a.task)}\nfrom: \"{a.source}\"\nto: \"{target_rel}\"\n"
+        f"---\nmode: {mode}\ntype: {a.ntype}\ntask: {_yaml_str(a.task)}\nfrom: \"{a.source}\"\nto: \"{target_rel}\"\n"
         f"written: \"{mint.timestamp(now)}\"\n---\n\n# Handoff: {a.task}\n\n"
         f"{body.strip() or '(no body - the task line is the whole spec)'}\n\n"
         f"Consuming this handoff means doing the task (or filing it into this folder's workflow-state), "
         f"recording the outcome in this folder's progress/log, and deleting this file.\n", encoding="utf-8")
+    LAST_NOTE = note
     _register_inbox(target_rel)
     try:
-        _items.upsert(target_rel, "handoff", note.name, a.task, created_by=a.source or "dispatcher", status="ready", force=True)
+        # an `answer`/`report` note is FILED: read by the folder next fire, never fired on its own (v5.2)
+        _items.upsert(target_rel, "handoff", note.name, a.task, created_by=a.source or "dispatcher", status="filed" if a.ntype in ("answer", "report") else "ready", force=True)
     except Exception as _e:
         print(f"(item not recorded: {_e})", file=sys.stderr)
+    try:                      # every state writer rebuilds the materialized board (v5.2)
+        import boardmat
+        boardmat.refresh("handoff")
+    except Exception:  # noqa: BLE001
+        pass
     sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
     if sid:  # sidecar ledger (v4.1): survives every rewrite of the binding YAML; release checks it
         lp.record_handoff(sid, "staged", lp.lock_rel(note))
@@ -107,6 +130,8 @@ def main() -> int:
             f"goal: {_yaml_str(a.task + ' (handoff from ' + (a.source or 'dispatcher') + ' - read .goal/inbox/' + note.name + ' first)')}\n"
             f"status: in_progress\ncriteria_met: []\ncriteria_remaining:\n  - {_yaml_str(a.task)}\n", encoding="utf-8")
         print(f"FIRED: {lp.lock_rel(note)} + .goal/state.yaml (your headless runner picks it up)")
+    elif a.ntype in ("answer", "report"):
+        print(f"FILED ({a.ntype}): {lp.lock_rel(note)} (read by {target_rel} next fire - it does NOT kick)")
     else:
         print(f"STAGED: {lp.lock_rel(note)} (read by whoever next claims {target_rel})")
     return 0

@@ -277,6 +277,16 @@ def _write_lock(lock_file: Path, window: str, task: str, stream: str, status: st
 
 # ----------------------------------------------------------------------------- commands
 
+def _refresh_board(trigger: str) -> None:
+    """Every state writer rebuilds the materialized board (v5.2). Best-effort: never breaks the write."""
+    try:
+        sys.path.insert(0, str(HERE.parent / "lib"))
+        import boardmat
+        boardmat.refresh(trigger)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def cmd_claim(a) -> int:
     rel = _folder(a.folder)
     if rel and not (ROOT / rel).is_dir():
@@ -331,6 +341,7 @@ def cmd_claim(a) -> int:
             print(l)
     except Exception as e:  # noqa: BLE001
         print(f"rules: hash check skipped ({type(e).__name__}: {e}) — bytes across hosts UNVERIFIED")
+    _refresh_board("claim")
     return 0
 
 
@@ -379,7 +390,9 @@ def _set_status(folder: str, new: str, task: str = "", stream: str = "") -> int:
 
 
 def cmd_close(a) -> int:
-    return _set_status(a.folder, "closing")
+    rc = _set_status(a.folder, "closing")
+    _refresh_board("complete")
+    return rc
 
 
 def cmd_reopen(a) -> int:
@@ -451,6 +464,7 @@ def cmd_release(a) -> int:
     lp.guard_log({"guard": "lock", "event": "release", "folder": home, "window": me.window,
                   "note": a.allow_dirty or ""})
     print(f"RELEASED {home or '<root>'}" + (f" (allow-dirty: {a.allow_dirty})" if a.allow_dirty else ""))
+    _refresh_board("release")
     return 0
 
 

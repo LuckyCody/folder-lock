@@ -21,6 +21,7 @@ each installation fills in its own list — the code only enforces that a waitin
     python lib/items.py upsert --folder F --kind pointer|handoff --ref R --title T [--created-by F] [--status S] [--question Q] [--force]
     python lib/items.py ready|in-progress|done <key>
     python lib/items.py wait <key> --question "<Q. Options: a/b/c. Recommendation: x>"
+    python lib/items.py answer <key> --text "<the ruling>" [--note-ref <name>]   # lockless: waiting_owner -> ready
     python lib/items.py from-pointer <folder> [--created-by F]
     python lib/items.py check-dup --owner F --title T        # exit 4 on a duplicate
 
@@ -40,7 +41,7 @@ import mint  # noqa: E402
 import lockpath as lp  # noqa: E402
 
 ROOT = lp.ROOT
-STATUSES = ("ready", "in_progress", "waiting_owner", "done", "waiting_world", "parked")
+STATUSES = ("ready", "in_progress", "waiting_owner", "done", "waiting_world", "parked", "filed")
 OWNER_RE = re.compile(r"\b(owner|ruling|rules?\s+on|approv\w*|decision|decides?|confirm\w*|says)\b", re.I)
 _ARROW = re.compile(r"\s*(?:→|->)\s*")
 # TIMED tripwire condition (v4.3): an ISO instant (date, optional HH:MM, optional zone word) followed by a "has passed"
@@ -118,6 +119,33 @@ def norm_title(s: str) -> str:
 
 def key_of(folder: str, kind: str, ref: str) -> str:
     return f"{folder.replace(chr(92), '/').strip('/')}|{kind}|{ref.replace(chr(92), '/')}"
+
+
+def handle(key: str) -> str:
+    """A stable, anchor-safe short handle for an item key (v5.2) — what a `waiting_owner` row is answered by.
+
+    Deterministic, so it needs no name document and survives a lost board: `<last folder segment>-<6 hex of the
+    key>`. An installation that keeps its own naming overrides this pair; `resolve_handle` is its only reader."""
+    import hashlib
+    folder = key.split("|", 1)[0]
+    tail = re.sub(r"[^a-z0-9]+", "-", folder.lower()).strip("-").rsplit("-", 1)[-1] or "item"
+    return f"{tail[:16]}-{hashlib.sha1(key.encode('utf-8')).hexdigest()[:6]}"
+
+
+def resolve_handle(data: dict, name: str) -> str:
+    """The item key a handle (or a full item key, or a unique handle prefix) names — '' when nothing matches."""
+    want = (name or "").strip()
+    if not want:
+        return ""
+    if want in data["items"]:
+        return want
+    low = want.lower()
+    hits = [k for k in data["items"] if handle(k) == low]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        hits = [k for k in data["items"] if handle(k).startswith(low)]
+    return hits[0] if len(hits) == 1 else ""
 
 
 def owner_of(folder: str) -> str:
@@ -201,6 +229,43 @@ def set_status(key: str, status: str, question: str | None = None, error: str | 
     return e
 
 
+class NotWaiting(Exception):
+    """`answer()` on an item that is not `waiting_owner` — the message names what it is instead."""
+
+    def __init__(self, key: str, status: str, title: str = ""):
+        super().__init__(f"{key} is {status or 'unknown'}, not waiting_owner" + (f" — {title[:120]}" if title else ""))
+        self.key, self.status, self.title = key, status, title
+
+
+def answer(key: str, note_ref: str, text: str, by: str = "") -> dict:
+    """The owner's ruling on a `waiting_owner` item lands LOCKLESS (board materialization v5.2).
+
+    The answer itself is a handoff note of type `answer` in the item's folder (`board.py answer` stages it via
+    `handoff.py`, so it is read by the folder's next fire); THIS call flips the asking item `waiting_owner -> ready`
+    and stamps `answered_at` / `answer_ref` / `answer`, which `sync()` honours while the pointer text still says
+    `WHEN ...`. Refuses (NotWaiting) on anything else — an answer to an item nobody asked is a duplicate fire."""
+    data = load()
+    e = data["items"].get(key)
+    if e is None:
+        raise KeyError(f"unknown item {key!r}")
+    if e.get("status") != "waiting_owner":
+        raise NotWaiting(key, str(e.get("status") or ""), str(e.get("title") or ""))
+    now = mint.timestamp()
+    _apply_status(e, "ready", None, now)
+    e.pop("stuck", None)
+    e.pop("last_error", None)
+    e["fails"] = 0
+    e["answered_at"] = now
+    e["answer_ref"] = note_ref
+    e["answer"] = " ".join((text or "").split())[:600]
+    if by:
+        e["answered_by"] = by
+    e["updated"] = now
+    data["items"][key] = e
+    save(data)
+    return e
+
+
 def record_fail(key: str, error: str, threshold: int = 3) -> dict:
     """An agent came back without moving the item. After `threshold` consecutive fails the item becomes
     waiting_owner with an auto-drafted question — a repeatedly failing item is a human blocker, not a loop."""
@@ -262,10 +327,27 @@ def pointer_line(folder: str) -> str:
     return ""
 
 
+RESURRECTED_THIS_RUN: list = []     # notes `_resurrected` deleted in THIS process — read by the next materialize
+
+
+def _live_store() -> bool:
+    """Is this process's state store the LIVE one — the backend the ENVIRONMENT names, online? The ONE predicate
+    the destructive half of `_resurrected` asks. A test that wants the deletion path monkeypatches THIS, never
+    `statestore.BACKEND`: on 2026-09-20 that patch pointed one fixture render at the live store (14 live items
+    closed, 22 notes stamped file_missing, 128 codenames retired in one board render), and `statestore._container`
+    has been fused on the process env since."""
+    import statestore
+    return statestore.BACKEND == statestore._env_backend() and not statestore.OFFLINE
+
+
 def _resurrected(folder: str, ref: str, e: dict, now: str) -> None:
     """A consumed handoff note that came back (sync re-scan / rollback wave; v4.3): keep it done, remove the file,
-    log ONE line in the owner folder's autorun log. Never fires. Renders marked READONLY leave the file alone."""
+    log ONE line in the owner folder's autorun log. Never fires. Renders marked READONLY leave the file alone.
+
+    The DELETION asks `_live_store()`: a process whose environment names a different backend than the one in use
+    is a fixture, and a fixture never deletes a real note."""
     import statestore
+    import mint as _mint
     e["updated"] = now
     if statestore.READONLY:
         return
@@ -275,9 +357,13 @@ def _resurrected(folder: str, ref: str, e: dict, now: str) -> None:
     e["resurrected"] = ref
     gone = ""
     try:
-        if p.is_file():
+        if p.is_file() and not _live_store():
+            gone = "file left in place (not the live store)"
+        elif p.is_file():
             p.unlink()
             gone = "file deleted"
+            RESURRECTED_THIS_RUN.append({"ts": _mint.timestamp(), "folder": folder, "ref": ref,
+                                         "title": e.get("title", ref), "outcome": e.get("outcome", "done")})
     except OSError as ex:
         gone = f"file left in place: {ex}"
     try:
@@ -298,7 +384,12 @@ def sync(rows: list, data: dict | None = None) -> dict:
     for r in rows:
         folder = r["folder"].replace("\\", "/").strip("/")
         kind, ref, title = r["kind"], r["ref"], r.get("title") or r["ref"]
-        derived, auto_q = classify_pointer_line(r.get("line", "")) if kind == "pointer" else ("ready", None)
+        if kind == "pointer":
+            derived, auto_q = classify_pointer_line(r.get("line", ""))
+        elif (r.get("type") or "").strip().lower() == "answer":
+            derived, auto_q = "filed", None      # an answer note is READ by the folder's next fire, never fired on its own
+        else:
+            derived, auto_q = "ready", None
         k = key_of(folder, kind, ref)
         e = data["items"].get(k)
         if e is None:
@@ -318,7 +409,22 @@ def sync(rows: list, data: dict | None = None) -> dict:
                 continue
             if cur == "in_progress" or (e.get("stuck") and not changed) or (cur == "waiting_owner" and not e.get("question_auto") and not changed):
                 pass
+            elif e.get("answered_at") and cur == "ready" and not changed:
+                # the owner ANSWERED (`board.py answer`, v5.2): the item was re-readied with the ruling filed into
+                # the folder's inbox, and the pointer text still SAYS `WHEN ...`. The hold ends when the fire
+                # rewrites the pointer (text moves) or when the loop works the item (`in_progress`/`done`).
+                pass
+            elif cur == "filed" and not changed:
+                # a report / answer note folded into the inbox is read on the owner's next fire; without this
+                # branch the render derives `ready` for the note (its file exists) and the loop burns a fire
+                # merely READING it. A rewritten note or `items.py ready <key>` puts it back.
+                pass
             elif cur != derived or changed:
+                if changed:
+                    # the condition itself moved: a ruling that answered the OLD text says nothing about the new
+                    # one, so the stamps go and the fire re-reads what is actually there
+                    for wk in ("answered_at", "answer_ref", "answer", "answered_by"):
+                        e.pop(wk, None)
                 keep_q = derived == "waiting_owner" and cur == "waiting_owner" and e.get("question") and not e.get("question_auto")
                 _apply_status(e, derived, None if keep_q else auto_q, now)
                 if derived == "waiting_owner" and not keep_q and auto_q:
@@ -377,6 +483,8 @@ def _cli(argv: list[str]) -> int:
     for name in ("ready", "in-progress", "done"):
         p = sub.add_parser(name); p.add_argument("key"); p.add_argument("--error", default=None)
     w = sub.add_parser("wait"); w.add_argument("key"); w.add_argument("--question", required=True)
+    an = sub.add_parser("answer"); an.add_argument("key"); an.add_argument("--text", required=True)
+    an.add_argument("--note-ref", default=""); an.add_argument("--by", default="")
     fp = sub.add_parser("from-pointer"); fp.add_argument("folder"); fp.add_argument("--created-by", default="")
     cd = sub.add_parser("check-dup"); cd.add_argument("--owner", required=True); cd.add_argument("--title", required=True)
     a = ap.parse_args(argv)
@@ -404,6 +512,11 @@ def _cli(argv: list[str]) -> int:
         set_status(a.key, a.cmd.replace("-", "_"), error=a.error); print(f"{a.key} -> {a.cmd.replace('-', '_')}"); return 0
     if a.cmd == "wait":
         set_status(a.key, "waiting_owner", question=a.question); print(f"{a.key} -> waiting_owner"); return 0
+    if a.cmd == "answer":
+        try:
+            answer(a.key, a.note_ref, a.text, by=a.by); print(f"{a.key} -> ready (answered)"); return 0
+        except NotWaiting as ex:
+            print(f"REFUSED: {ex}", file=sys.stderr); return 3
     if a.cmd == "from-pointer":
         k, e = from_pointer(a.folder, a.created_by); print(f"{k} -> {e['status']}"); return 0
     if a.cmd == "check-dup":

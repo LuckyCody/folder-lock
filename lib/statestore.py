@@ -88,10 +88,23 @@ def _say(msg: str) -> None:
 
 # ----------------------------------------------------------------------------- backends
 
-def _blob(name: str):
+def _env_backend() -> str:
+    """The backend the PROCESS ENVIRONMENT names — the witness a patched attribute cannot fake (v5.2)."""
+    return (os.environ.get("FOLDER_LOCK_STATE_BACKEND") or "file").strip().lower()
+
+
+def _container():
+    """The live container client, behind the ENV FUSE (v5.2).
+
+    A test once monkeypatched `statestore.BACKEND = "blob"` for one render and that render reached the LIVE
+    store: 14 live pointer items closed, 22 notes stamped file_missing, 128 codenames retired, in one `/next`.
+    The process ENVIRONMENT is the witness an attribute cannot fake — when it does not name the blob backend,
+    the live container is unreachable from this process whatever the attribute says."""
     global _client
     if OFFLINE:
         raise Unavailable("FOLDER_LOCK_STATE_OFFLINE")
+    if _env_backend() != "blob":
+        raise Unavailable("FOLDER_LOCK_STATE_BACKEND names a non-blob backend — the live store is fused off for this process")
     if not ACCOUNT:
         raise Unavailable("FOLDER_LOCK_STATE_BACKEND=blob but FOLDER_LOCK_STATE_ACCOUNT is unset")
     if _client is None:
@@ -101,7 +114,11 @@ def _blob(name: str):
             raise Unavailable(f"azure sdk missing (pip install azure-identity azure-storage-blob): {e}")
         cred = credential()
         _client = BlobServiceClient(f"https://{ACCOUNT}.blob.core.windows.net", credential=cred).get_container_client(CONTAINER)
-    return _client.get_blob_client(f"{name}.json")
+    return _client
+
+
+def _blob(name: str):
+    return _container().get_blob_client(f"{name}.json")
 
 
 _cred = None
@@ -185,6 +202,103 @@ def _backend_put(name: str, obj, etag) -> str:
         if n in ("ResourceModifiedError", "ResourceExistsError") or getattr(e, "status_code", None) == 412:
             raise Conflict(f"{name}: {n}")
         raise Unavailable(f"{n}: {str(e)[:160]}")
+
+
+# ----------------------------------------------------------------------------- raw objects (the materialized board, v5.2)
+# `board/board.json` + `board/board.md` (lib/boardmat.py) are NOT documents in the sense above: no merge, no
+# outbox, no conditional write — last writer wins. A materialized VIEW is derived from the documents, so a lost
+# race costs nothing: the next state change materializes again, and the `source_stamps` inside the object say
+# which document versions it was derived from (a loser is detectable, never silently trusted).
+
+def _raw_blob(path: str):
+    return _container().get_blob_client(path)
+
+
+def _atomic_bytes(p: Path, data: bytes) -> None:
+    """Replace `p` with `data` in one step: a concurrent reader sees the old or the new bytes, never half a file."""
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+    tmp.write_bytes(data)
+    for attempt in range(5):          # Windows: another writer/reader (or a sync client) holds the target open for a
+        try:                          # moment -> WinError 32/5, which is transient, not a lost race
+            tmp.replace(p)
+            return
+        except OSError:
+            if attempt == 4:
+                tmp.unlink(missing_ok=True)
+                raise
+            import time
+            time.sleep(0.02 * (attempt + 1))
+
+
+def raw_get(path: str) -> tuple:
+    """-> (bytes | None, etag | None). None,None = the object does not exist. Raises Unavailable."""
+    if BACKEND == "file":
+        if OFFLINE:
+            raise Unavailable("FOLDER_LOCK_STATE_OFFLINE")
+        p = FILESTORE / path
+        if not p.is_file():
+            return None, None
+        raw = p.read_bytes()
+        return raw, hashlib.sha1(raw).hexdigest()
+    try:
+        bc = _raw_blob(path)
+        dl = bc.download_blob(timeout=20)
+        raw = dl.readall()
+        return raw, dl.properties.etag
+    except Unavailable:
+        raise
+    except Exception as e:  # noqa: BLE001
+        if e.__class__.__name__ == "ResourceNotFoundError":
+            return None, None
+        raise Unavailable(f"{e.__class__.__name__}: {str(e)[:160]}")
+
+
+def raw_put(path: str, data: bytes, content_type: str = "application/octet-stream") -> str:
+    """Unconditional write (last writer wins). Returns the new etag. Raises Unavailable; READONLY -> ''."""
+    if READONLY:
+        return ""
+    if BACKEND == "file":
+        if OFFLINE:
+            raise Unavailable("FOLDER_LOCK_STATE_OFFLINE")
+        _atomic_bytes(FILESTORE / path, data)
+        return hashlib.sha1(data).hexdigest()
+    try:
+        from azure.storage.blob import ContentSettings
+        bc = _raw_blob(path)
+        props = bc.upload_blob(data, overwrite=True, timeout=30,
+                               content_settings=ContentSettings(content_type=content_type))
+        return props["etag"]
+    except Unavailable:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise Unavailable(f"{e.__class__.__name__}: {str(e)[:160]}")
+
+
+def doc_etag(name: str):
+    """The current version stamp of a DOCUMENT without downloading it (HEAD; file backend: sha1 of the bytes).
+    None = the document does not exist. Raises Unavailable. This is what a board glance compares its
+    `source_stamps` against — one HEAD per document instead of a full render."""
+    if name not in DOCS:
+        raise ValueError(f"unknown document {name!r}")
+    if BACKEND == "file":
+        if OFFLINE:
+            raise Unavailable("FOLDER_LOCK_STATE_OFFLINE")
+        p = FILESTORE / f"{name}.json"
+        return hashlib.sha1(p.read_bytes()).hexdigest() if p.is_file() else None
+    try:
+        return _blob(name).get_blob_properties(timeout=20).etag
+    except Unavailable:
+        raise
+    except Exception as e:  # noqa: BLE001
+        if e.__class__.__name__ == "ResourceNotFoundError":
+            return None
+        raise Unavailable(f"{e.__class__.__name__}: {str(e)[:160]}")
+
+
+def loaded_etag(name: str):
+    """The etag `load()`/`save()` last saw for `name` in THIS process (None when never loaded or offline)."""
+    return (_base.get(name) or (None, None))[0]
 
 
 # ----------------------------------------------------------------------------- cache / outbox

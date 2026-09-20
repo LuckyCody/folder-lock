@@ -38,6 +38,16 @@ def append(folder: str, item: str, status: str, decisions: str = "", commit: str
     return p
 
 
+def lines(folder: str) -> list:
+    """The folder's raw autorun lines, oldest first — what the board shows inline under a waiting row
+    (v5.2). Never raises; a folder that never ran reports nothing."""
+    p = ROOT / folder / "workflow-state" / "autorun-log.md"
+    try:
+        return [l.rstrip() for l in p.read_text(encoding="utf-8", errors="replace").splitlines() if l.startswith("- ")]
+    except OSError:
+        return []
+
+
 def digest(since: str = "") -> list:
     out = []
     for dirpath, dirnames, filenames in os.walk(ROOT):

@@ -346,6 +346,11 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             k = f"(item not written: {e})"
         print(f"  board: item {k} ready")
+        try:                  # v5.2: rebuild the materialized board here, where the state moved
+            import boardmat
+            boardmat.refresh("new")
+        except Exception:  # noqa: BLE001
+            pass
     except Exception as e:  # noqa: BLE001
         print(f"  board: not updated ({e}) — the next render sweeps the pointer in")
 

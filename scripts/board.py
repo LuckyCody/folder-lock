@@ -2,6 +2,13 @@
 
   python scripts/board.py                    # classic full board (human view)
   python scripts/board.py json [--no-touch]  # machine view: {"folders", "deploys", "locks", "items", "digest"}
+  python scripts/board.py glance [--no-touch] [--json]
+                                             # v5.2: ONE GET of the materialized board in the state store — no lock,
+                                             # no kick, no guards, one touch. The cheap path a session starts on.
+  python scripts/board.py materialize [--trigger <x>]
+                                             # rebuild + write the board by hand (every state writer does it anyway)
+  python scripts/board.py answer <handle> "<the ruling>"
+  python scripts/board.py answer --batch <file|->   # LOCKLESS owner answer(s): files a type `answer` handoff, no lock
   python scripts/board.py menu [--no-touch] [--no-kick] [--all]
                                              # the owner's menu, gated on the §13 exit condition:
                                              #   ready > 0  -> digest · waiting-on-owner · locks · deploys · ONE line
@@ -70,6 +77,19 @@ def _note_task(p: Path) -> str:
         return p.stem
 
 
+def _note_field(p: Path, name: str) -> str:
+    """One frontmatter value out of a handoff note (`type:` decides filed vs ready — v5.2). Never raises."""
+    try:
+        head = p.read_text(encoding="utf-8", errors="replace").split("---", 2)
+        body = head[1] if len(head) > 2 else ""
+        for raw in body.splitlines():
+            if raw.strip().lower().startswith(name + ":"):
+                return raw.split(":", 1)[1].strip().strip(chr(34)).strip()
+    except OSError:
+        pass
+    return ""
+
+
 def classify(action: str):
     a = action.strip(); low = a.lower()
     if not a:
@@ -122,6 +142,7 @@ def scan(root: Path) -> list:
                 notes = [f for f in sorted(inbox.glob("*.staged.md")) if not _first_line(f).upper().startswith("# CONSUMED")]
                 it["handoffs"] = [f.name for f in notes]
                 it["handoff_tasks"] = {f.name: _note_task(f) for f in notes}
+                it["handoff_types"] = {f.name: _note_field(f, "type") for f in notes}
             dirnames[:] = []
         elif p.name == "workflow-state" and "current-pointer.md" in filenames:
             rel = p.parent.relative_to(root).as_posix() or "."
@@ -173,7 +194,8 @@ def item_overlay(folders: list) -> dict:
             rows.append({"folder": f, "kind": "pointer", "ref": "workflow-state/current-pointer.md",
                          "title": line or "(pointer has no action line)", "line": line})
         for name in it.get("handoffs", []):
-            rows.append({"folder": f, "kind": "handoff", "ref": name, "title": it.get("handoff_tasks", {}).get(name, name)})
+            rows.append({"folder": f, "kind": "handoff", "ref": name, "title": it.get("handoff_tasks", {}).get(name, name),
+                         "type": (it.get("handoff_types") or {}).get(name, "")})
     try:
         live = items.sync(rows)
     except Exception:  # noqa: BLE001
@@ -192,6 +214,11 @@ def build_view() -> dict:
     folders = scan(lp.ROOT)
     deploys = deploy_queue()
     ov = item_overlay(folders)
+    try:                      # v5.2: handle + pointer tail + autorun excerpt under every waiting row
+        import boardmat
+        boardmat.enrich_waiting({"items": ov})
+    except Exception:  # noqa: BLE001
+        pass
     try:
         import autorun_log as alog
         digest = alog.digest(alog.last_seen())
@@ -228,11 +255,23 @@ def _sec_digest(v: dict) -> list:
 
 
 def _sec_waiting(v: dict) -> list:
+    """One row block per waiting item: handle · owner · since, the question, the last pointer + autorun lines (so the
+    paste triages without opening the folder), and the batch anchor. `board.py answer <handle> <text>` is LOCKLESS."""
     rows = []
-    for owner, lst in v["items"]["waiting_owner"].items():
+    waiting = v["items"]["waiting_owner"]
+    if waiting:
+        rows.append('answer lockless — `python scripts/board.py answer <handle> "the ruling"`, or paste back one '
+                    'block per item with its `<!-- answer: <handle> -->` anchor kept (--batch <file|->)')
+    for owner, lst in waiting.items():
         for r in lst:
-            rows.append(_fit(f"{owner} · {r.get('title', '')[:70]} · since {r.get('blocked_since', '?')}"))
+            handle = r.get("handle") or ""
+            rows.append(_fit(f"{handle} · {owner} · {r.get('title', '')[:70]} · since {r.get('blocked_since', '?')}"))
             rows.append(_fit(f"   Q: {r.get('question', '')}{' (auto-drafted)' if r.get('question_auto') else ''}"))
+            for ln in (r.get("pointer_tail") or [])[-2:]:
+                rows.append(_fit(f"   ↳ pointer: {ln}"))
+            for ln in (r.get("autorun_excerpt") or [])[-3:]:
+                rows.append(_fit(f"   ↳ autorun: {ln}"))
+            rows.append(f"   <!-- answer: {handle} -->")
     return _sec("⏸ waiting on the owner (decision-ready — a one-line answer unblocks each)", rows)
 
 
@@ -418,8 +457,42 @@ def main() -> int:
     argv = sys.argv[1:]
     cmd = argv[0] if argv and not argv[0].startswith("--") else ""
     touch = "--no-touch" not in argv
+    if cmd in ("glance", "materialize", "answer"):   # v5.2: the cheap / lockless paths never pay for a full build_view
+        import boardmat
+        if cmd == "glance":
+            return boardmat.glance(touch=touch, want_json="--json" in argv)
+        if cmd == "materialize":
+            trig = ""
+            if "--trigger" in argv:
+                i = argv.index("--trigger")
+                trig = argv[i + 1] if i + 1 < len(argv) else ""
+            boardmat.materialize(trig or "render_fallback", quiet=False)
+            return 0
+        rest = argv[1:]
+        if "--batch" in argv:
+            i = argv.index("--batch")
+            target = argv[i + 1] if i + 1 < len(argv) else ""
+            if not target:
+                print("ERROR: --batch needs a file path (or - for stdin)", file=sys.stderr)
+                return 2
+            return boardmat.answer_batch(target)
+        names = [x for x in rest if not x.startswith("--")]
+        if not names:
+            print("ERROR: answer needs a handle (or --batch <file|->)", file=sys.stderr)
+            return 2
+        text = " ".join(names[1:]).strip()
+        if not text:
+            print("ERROR: answer needs the ruling text: board.py answer <handle> <text>", file=sys.stderr)
+            return 2
+        return boardmat.answer(names[0], text)
     v = build_view()
     write_signpost(v, tracked="--signpost" in argv)
+    if "--signpost" in argv:   # a signoff artifact, not a look: refresh the materialized board (v5.2)
+        try:
+            import boardmat
+            boardmat.materialize("signoff", v=v, quiet=True)
+        except Exception:  # noqa: BLE001
+            pass
     if cmd == "json":
         window = _reader_identity() if touch else ""
         out = {k: v[k] for k in ("generated", "folders", "deploys", "locks", "digest")}
@@ -439,7 +512,8 @@ def main() -> int:
             _touch(window, v, "menu", note.startswith("loop kicked"))
         return 0
     if cmd:
-        print(f"unknown subcommand: {cmd} (expected: menu | json, or no args / --signpost)", file=sys.stderr)
+        print(f"unknown subcommand: {cmd} (expected: menu | json | glance | materialize | answer, "
+              f"or no args / --signpost)", file=sys.stderr)
         return 2
     print(render_full(v))
     return 0
