@@ -22,12 +22,20 @@ Held folder (normal case), in order:
   4. autorun-log line                        (`autorun_log.py append`)
   5. `lock.py release <folder>`               (refuses on a stale pointer / dirty tree / orphaned handoff — surfaced, exit 6)
   6. board --signpost + memory mirror + resumer kick (`--no-kick` skips the kick)
-  7. prints the terminal block — paste it VERBATIM as the last lines of the reply (the Stop hook checks it)
+  7. writes the SIGNOFF RECORD (`<sessions>/<sid>.signoff.json` — the terminal block as data, what the Stop hook
+     reads) and prints TWO outputs: the block (for the pointer and the loop — never pasted into the chat) and the
+     CLOSING MESSAGE — the ONLY thing the chat shows: one plain-English line per item that waits on the owner and
+     per direct answer to a question the owner asked (`--answer`), no commands, no paths, no ids; when nothing
+     waits on the owner it is exactly `Nothing needed from you.` (v5.3, owner ruling 2026-09-21)
+
+  python scripts/signoff.py --turn [--ask "<question for the owner>"] [--answer "<plain answer>"] [--next "<technical next>"]
+     a MID-TASK turn that ends on a question to the owner: nothing released, no board refresh — just the record
+     (status blocked, held = the locks this window holds) and the closing message. The Stop hook accepts it.
 
 held: none (a session that claimed nothing — browsing, a refused diverged checkout, deferring to an existing item):
   no lock release, no commit; ONE record line into the autorun log of `--folder` (or the root lane) and — when
   `--folder` is given and free — a dated session note under the H1 of that folder's pointer (§17: the pointer stays the
-  place the next session looks); then the terminal block with `held: none` and `next:` from the board.
+  place the next session looks); then the record (`held: none`, `next:` from the board) and the closing message.
 """
 from __future__ import annotations
 
@@ -50,6 +58,27 @@ TREE = lp.LOCK_TREE
 ICM = Path(__file__).resolve().parent            # scripts/
 LIB = ICM.parent / "lib"
 FLAGGED = ("waiting_owner", "parked")
+
+
+def _waiting_questions(d: dict) -> list:
+    """The owner-facing text of every item of the folder that waits on the owner."""
+    out = []
+    for e in d.get("flagged", []):
+        q = (e.get("question") or e.get("title") or "").strip()
+        if q:
+            out.append(q)
+    return out
+
+
+def emit(sid: str, *, status: str, held: str, next_: str, folder: str, closing: str, kind: str = "signoff") -> None:
+    """The two outputs, in this order: the technical block (record + pointer, NOT for the chat) and, LAST, the
+    closing message — the only thing the agent pastes into the chat."""
+    lc.write_signoff_record(sid, status=status, held=held, next_=next_, folder=folder, closing=closing, kind=kind)
+    print()
+    print("--- terminal block (written to the signoff record; for the pointer and the loop, NOT for the chat) ---")
+    print(lc.format_terminal_block(status, held, next_))
+    print("--- closing message (paste THIS into the chat, and nothing else) ---")
+    print(closing)
 OPEN = ("ready", "in_progress", "waiting_world", "waiting_owner", "parked")
 
 
@@ -223,8 +252,20 @@ def held_none(a: argparse.Namespace, st: dict) -> int:
                 print(f"pointer: session note added under the H1 of {folder}/workflow-state/current-pointer.md")
             elif foreign:
                 print(f"pointer: {folder} is held by {foreign[0].window} — no note written (their folder while they hold it)")
-    print()
-    print(lc.format_terminal_block(d["status"], "none", d["next"]))
+    closing = lc.format_closing_message(_waiting_questions(d) + list(a.ask or []), list(a.answer or []))
+    emit(_sid(), status=d["status"], held="none", next_=d["next"], folder=folder, closing=closing)
+    return 0
+
+
+def turn_end(a: argparse.Namespace, st: dict) -> int:
+    """`--turn`: a mid-task turn ends on a question to the owner. Nothing is released; the record says
+    `blocked`, held = the locks this window holds, and the closing message carries the question(s)."""
+    held = list(st["held"])
+    folder = (a.folder or "").replace("\\", "/").strip("/") or (held[0] if held else "")
+    next_ = a.next or lc.NEXT_NONE
+    closing = lc.format_closing_message(list(a.ask or []), list(a.answer or []))
+    emit(_sid(), status="blocked", held=", ".join(held) if held else "none", next_=next_, folder=folder,
+         closing=closing, kind="turn")
     return 0
 
 
@@ -238,6 +279,10 @@ def main() -> int:
     ap.add_argument("--no-kick", action="store_true")
     ap.add_argument("--allow-dirty", default="", help="passed to lock.py release (say why)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--answer", action="append", default=[], help="a plain-English answer to a question the owner asked (repeatable) — goes into the closing message")
+    ap.add_argument("--ask", action="append", default=[], help="a new question for the owner raised this turn (repeatable) — 'Waiting on you: …' in the closing message")
+    ap.add_argument("--turn", action="store_true", help="mid-task turn end (ends on a question to the owner): record + closing message only, nothing released")
+    ap.add_argument("--next", default="", help="with --turn: the technical next line for the record (default: none — waiting on the owner)")
     a = ap.parse_args()
 
     sid = _sid()
@@ -246,6 +291,8 @@ def main() -> int:
     except lp.IdentityConflict as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 5
+    if a.turn:
+        return turn_end(a, st)
     if a.held == "none" or st["state"] != "claimed":
         if st["state"] == "claimed" and a.held == "none":
             print(f"ERROR: --held none, but this window holds {', '.join(st['held'])} — run without --held (or release first)", file=sys.stderr)
@@ -331,9 +378,10 @@ def main() -> int:
                     print(f"autorun loop: kick failed ({e})")
             else:
                 print("autorun loop: not kicked (set AUTORUN_RUNNER to the agent command, or run scripts/autorun.py yourself)")
-    # 7. the block — held is none after the release
-    print()
-    print(lc.format_terminal_block(d["status"], "none" if not a.dry_run else folder, d["next"]))
+    # 7. the two outputs — held is none after the release; the record is what the Stop hook reads
+    closing = lc.format_closing_message(_waiting_questions(d) + list(a.ask or []), list(a.answer or []))
+    emit(sid, status=d["status"], held="none" if not a.dry_run else folder, next_=d["next"], folder=folder,
+         closing=closing)
     return 0
 
 

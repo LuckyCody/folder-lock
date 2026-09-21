@@ -6,22 +6,27 @@ so they cannot disagree:
 
   1. In which STATE is this session?          session_state()  -> unclaimed | claimed | signed-off
   2. May this session WRITE this path?         write_verdict()  -> (allow, reason)   [edit guard, shell guard, commit guard]
-  3. Did the turn END properly?                parse_terminal_block() over the final assistant message [Stop hook]
+  3. Did the turn END properly?                read_signoff_record() — the record signoff.py wrote this turn [Stop hook]
 
 State machine (§17):  unclaimed -> claimed(<folder>) -> signed-off
   unclaimed   no identity, or a READER binding (window, no folder)      writes: _inbox/ drops + workflow-state/ only
   claimed     a fresh lock of this window (LOCK.yaml or .firing.lock)   writes: the held folder(s) + the two exceptions
   signed-off  identity bound, no fresh lock left                        writes: as unclaimed
 
-Terminal block — the last three non-empty lines of every final message, verbatim structure:
+Two outputs per turn end (v5.3, owner ruling 2026-09-21):
 
-  status: done | blocked | handed-off
-  held:   <folder> | none
-  next:   <exact command> | none — waiting on the owner
+  a) the TERMINAL BLOCK — for the pointer and the loop, technical, never pasted into the chat:
+       status: done | blocked | handed-off
+       held:   <folder> | none
+       next:   <exact command> | none — waiting on the owner
+     `signoff.py` writes it into the session's SIGNOFF RECORD (`<sessions>/<sid>.signoff.json`) and into the
+     folder's pointer; the Stop hook reads the RECORD (`held:` must agree with the locks on disk).
+  b) the CLOSING MESSAGE — the only thing the chat shows: one plain-English line per item that waits on the
+     owner and per direct answer to a question the owner asked; no commands, no paths, no ids. When nothing
+     waits on the owner it is exactly `Nothing needed from you.` (format_closing_message()).
 
-`held:` must agree with the locks on disk (the Stop hook checks). A headless agent may follow the block
-with ONE resumer outcome line (`DONE` | `WAITING_CODY` | `FAILED: …`) — the resumer reads that line,
-the Stop hook reads the block.
+A headless agent still ends its final reply with ONE resumer outcome line (`DONE` | `WAITING_CODY` |
+`FAILED: …`) — the resumer reads that line; the Stop hook reads the record.
 
 Nothing here writes a lock or a file; the module decides, the callers act.
 """
@@ -60,6 +65,112 @@ def format_terminal_block(status: str, held: str, next_: str) -> str:
     if status not in STATUSES:
         raise ValueError(f"status {status!r} not in {STATUSES}")
     return f"status: {status}\nheld:   {held or 'none'}\nnext:   {next_ or NEXT_NONE}"
+
+
+# ----------------------------------------------------------------------------
+# signoff record + closing message (v5.3 — the two outputs)
+# ----------------------------------------------------------------------------
+
+NOTHING_NEEDED = "Nothing needed from you."
+RECORD_SUFFIX = ".signoff.json"
+
+
+def signoff_record_path(sid: str) -> Path:
+    return lp.SESSIONS / f"{sid or 'nosid'}{RECORD_SUFFIX}"
+
+
+def write_signoff_record(sid: str, *, status: str, held: str, next_: str, folder: str = "",
+                         closing: str = "", kind: str = "signoff") -> Path:
+    """The turn-end record the Stop hook reads: the terminal block as data, the closing message, and when
+    it was written. `kind` is `signoff` (full: released, board refreshed) or `turn` (a mid-task turn that
+    ends on a question to the owner — nothing released). Overwrites the previous record of the session."""
+    import time
+    blk = parse_terminal_block(format_terminal_block(status, held, next_))
+    if blk is None:
+        raise ValueError("terminal block does not validate")
+    from datetime import datetime as _dt
+    rec = {"session": sid, "kind": kind, "ts": time.time(), "written": _dt.now().strftime(lp.TS_FMT),
+           "status": blk["status"], "held": blk["held"], "held_list": blk["held_list"], "next": blk["next"],
+           "folder": folder, "closing": closing or NOTHING_NEEDED,
+           "block": format_terminal_block(status, held, next_)}
+    p = signoff_record_path(sid)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+    return p
+
+
+def read_signoff_record(sid: str) -> Optional[dict]:
+    p = signoff_record_path(sid)
+    try:
+        rec = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(rec, dict) or rec.get("status") not in STATUSES:
+        return None
+    rec.setdefault("held_list", [] if str(rec.get("held", "none")).lower() == "none" else [rec.get("held")])
+    return rec
+
+
+def format_closing_message(waiting: list, answers: Optional[list] = None) -> str:
+    """The chat-facing half: one line per direct answer, one line per item that waits on the owner —
+    plain language, no commands, no paths, no ids. Empty -> exactly NOTHING_NEEDED."""
+    lines = [str(a).strip() for a in (answers or []) if str(a).strip()]
+    lines += [f"Waiting on you: {str(w).strip()}" for w in (waiting or []) if str(w).strip()]
+    return "\n".join(lines) if lines else NOTHING_NEEDED
+
+
+def _iso_to_epoch(s: str) -> Optional[float]:
+    from datetime import datetime, timezone
+    try:
+        d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.timestamp()
+
+
+def last_prompt_time(transcript_path: str) -> Optional[float]:
+    """Epoch of the last HUMAN prompt in a Claude Code transcript (a `user` entry whose content is text, not a
+    tool_result). None when the transcript is missing or carries no timestamps (fixture transcripts)."""
+    if not transcript_path:
+        return None
+    try:
+        raw = Path(transcript_path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(raw):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if o.get("type") != "user" or o.get("isSidechain"):
+            continue
+        c = o.get("message", {}).get("content")
+        human = isinstance(c, str) or (isinstance(c, list) and any(
+            isinstance(b, dict) and b.get("type") == "text" for b in c))
+        if not human:
+            continue
+        ts = o.get("timestamp")
+        return _iso_to_epoch(ts) if ts else None
+    return None
+
+
+def record_covers_turn(rec: Optional[dict], transcript_path: str, slack: float = 2.0) -> bool:
+    """True when `rec` was written during the CURRENT turn: at or after the last human prompt. A transcript
+    without timestamps (fixtures) cannot date the turn — then any record of the session counts."""
+    if not rec:
+        return False
+    t0 = last_prompt_time(transcript_path)
+    if t0 is None:
+        return True
+    try:
+        return float(rec.get("ts", 0)) >= t0 - slack
+    except (TypeError, ValueError):
+        return False
 
 
 def parse_terminal_block(text: str) -> Optional[dict]:

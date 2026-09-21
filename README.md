@@ -58,7 +58,7 @@ git add <your paths> && git commit -m "..."                # identity comes from
 python scripts/lock.py close finance/payroll               # task done -> closing; Stop hook now insists on the rest
 #     write finance/payroll/workflow-state/current-pointer.md, commit
 python scripts/deploy_request.py --for finance/payroll     # v3: request the deploy — the single deployer ships HEAD (§11)
-python scripts/signoff.py                                  # v5: from-pointer, status/next from the board, archive decision, release, the terminal block
+python scripts/signoff.py                                  # v5.3: from-pointer, status/next from the board, archive decision, release; writes the signoff RECORD (the block, for the Stop hook) and prints the CLOSING MESSAGE (the chat)
 # (a session that claimed nothing: python scripts/signoff.py --held none — every session ends here)
 python scripts/new.py store-ops/kiosk --goal "..."          # v5: NEW work = scaffold + registry entry + claim + board item, one step
 ```
@@ -72,7 +72,7 @@ Inside Claude Code no env var is needed: `claim` binds the minted window to `CLA
 | `require_lock.py` (PreToolUse) | editing without a lock, under someone else's lock, in a folder with no `.goal/` — before files tangle |
 | `check_locks.py` (pre-commit) | staged paths under another window's lock, unclaimed/unguarded folders, `git add -A` sweeps, missing identity, a hook that is not actually wired |
 | `protect_main.py` (pre-commit) | plain commits on `main`/`master` |
-| `require_signoff.py` (Stop) | a final message without the terminal block (`status / held / next`), a `held:` that disagrees with the locks on disk, a `closing` lock with the pointer stale or the lock not released (v5) |
+| `require_signoff.py` (Stop) | a turn without a signoff record from THIS turn, a record whose `held` disagrees with the locks on disk (`none` while your lock is fresh; a folder you do not hold), a closing lock with a stale pointer or an unreleased lock. The chat is never inspected (v5.3). |
 | `require_write_scope.py` (PreToolUse on Bash/PowerShell) | shell redirections (`>`, `>>`, `tee`, `Out-File`, `Set-Content`) outside the held folder — the same verdict as the edit guard (v5) |
 | `session_start.py` (SessionStart) | a blank window without rules: binds a fresh reader window, states the invariants, forces the triage (v5) |
 | `check_pointer_read.py` (PostToolUse on Read) | a sliced read of a pointer / inbox note / rules file presented as complete — injects `READ IN FULL ✓` or `PARTIAL READ ⚠` + the action line verbatim |
@@ -104,6 +104,10 @@ The board used to be derived live on every look — a full tree walk, `items.syn
 - **Handoff type `answer`** (`scripts/handoff.py --type answer`): filed, not fired — an `answer`/`report` note is `status: filed`, read by the folder's next fire (which acts on the ruling) instead of kicking it. `handoff.py` refuses `answer` + `--mode fire`.
 - **Env fuse** (`lib/statestore.py`): `_container()` refuses the live blob container unless the PROCESS ENVIRONMENT names `FOLDER_LOCK_STATE_BACKEND=blob` — a test once monkeypatched `statestore.BACKEND = "blob"` and one render reached the live store (14 real items closed); the environment is the witness an attribute cannot fake. `items._live_store()` is the ONE predicate the destructive resurrected-note deletion asks.
 - **Tests**: `tests/test_board_materialize.py` (13 checks, plain `python` or pytest) — materialize shape + `<!-- answer: <handle> -->` anchors, the fresh-glance budget (ONE raw GET, the `items` etag check, ONE write), stale fallback, idempotency + concurrent writers, the resurrected digest, the lockless answer + batch parser, and the env fuse.
+
+## What's new in v5.3
+
+**Two outputs per turn end (owner ruling 2026-09-21).** The signoff used to end by printing the terminal block for the agent to paste as the last lines of its reply — technical, full of commands and ids, and the Stop hook read it back out of the transcript. Now `scripts/signoff.py` writes the block into a **signoff record** (`<sessions>/<sid>.signoff.json`, `lib/lifecycle.write_signoff_record`) and prints two things: the block (for the pointer and the loop — never for the chat) and, last, the **closing message** — the only thing the chat shows: one plain-language line per item that waits on the owner and per direct answer to a question the owner asked (`--answer`), no commands, no paths, no ids; when nothing waits on the owner exactly `Nothing needed from you.` `hooks/require_signoff.py` reads the record (from THIS turn: at or after the last human prompt; `held` checked against the locks on disk) and never the chat. A mid-task turn that ends on a question runs `python scripts/signoff.py --turn --ask "<question>"` — record + closing message, nothing released. `tests/conflict_run.sh` scenarios 25 and 31 drive the record.
 
 ## What's new in v5
 

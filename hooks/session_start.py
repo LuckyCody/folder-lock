@@ -62,13 +62,15 @@ def lifecycle_text(inp: dict) -> str:
         st = lc.session_state(sid)
     except Exception as e:  # noqa: BLE001
         return (f"SESSION LIFECYCLE (PROTOCOL §17): state unknown ({type(e).__name__}: {e}) — run `python {S}/../lib/lifecycle.py state`. "
-                f"Every turn ends with the terminal block:\n{TERMINAL_BLOCK}")
+                f"Every turn ends through `python {S}/signoff.py` (full) or `python {S}/signoff.py --turn` (mid-task); "
+                f"the chat shows only the closing message, the record carries:\n{TERMINAL_BLOCK}")
     window = st["window"]
     if st["fired"]:
         folder = (os.environ.get("ICM_FOLDER") or "").strip() or (st["held"][0] if st["held"] else "?")
         return (f"SESSION LIFECYCLE (§17) — HEADLESS AGENT {window}: no triage. Folder `{folder}` is yours (.goal/.firing.lock). "
-                f"Work the ONE item, sign off yourself (`python {S}/signoff.py`), and END the final reply with the terminal block, "
-                f"then your outcome line (DONE | WAITING_OWNER | FAILED: …):\n{TERMINAL_BLOCK}\n"
+                f"Work the ONE item, sign off yourself (`python {S}/signoff.py` — it writes the record the Stop hook reads and "
+                f"prints the closing message), END the final reply with that closing message and your outcome line "
+                f"(DONE | WAITING_OWNER | FAILED: …). The record carries:\n{TERMINAL_BLOCK}\n"
                 f"Writes outside `{folder}` are denied (handoff.py instead).")
     if not window and sid:
         window = _bind_fresh(sid)
@@ -87,8 +89,10 @@ def lifecycle_text(inp: dict) -> str:
     return (
         f"SESSION LIFECYCLE (PROTOCOL §17 — mandatory, enforced by hooks) · state: {st['state']} · {bound}\n"
         f"Every session is in exactly one state: unclaimed → claimed(<folder>) → signed-off. Every session ends through the signoff, "
-        f"including one that held nothing. Every final reply ENDS with the terminal block (the Stop hook blocks the turn otherwise; "
-        f"`held:` must match the locks on disk):\n{TERMINAL_BLOCK}\n"
+        f"including one that held nothing. Every turn ends by RUNNING the signoff (`python {S}/signoff.py`, or `--turn` mid-task, "
+        f"or `--held none`): it writes the record the Stop hook checks (`held:` must match the locks on disk) and prints the "
+        f"CLOSING MESSAGE — the only thing you paste into the chat (what waits on the owner, answers to the owner; else "
+        f"exactly `Nothing needed from you.`). The block below stays in the record and the pointer, never in the chat:\n{TERMINAL_BLOCK}\n"
         f"{first}\n"
         f"Writes: only inside the held folder (+ `{os.environ.get('FOLDER_LOCK_INBOX', '_inbox')}/` drops and `workflow-state/`); with no lock, "
         f"nothing but the drop zone. Anything else is a handoff: python {S}/handoff.py --to <folder> --task \"...\" "

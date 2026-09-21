@@ -51,9 +51,19 @@ PYT
   LAST_IN=$(printf '{"session_id":"%s","hook_event_name":"Stop","prompt_id":"%s","stop_hook_active":false,"transcript_path":"%s"}' "$sid" "$pid" "$trp")
   LAST_OUT=$(printf '%s' "$LAST_IN" | $PY .githooks/require_signoff.py 2>&1); LAST_RC=$?; return $LAST_RC
 }
-hook_stop() {  # sid prompt_id [held=none] [status=done] [next] -> Stop guard, final message ending in a TRUTHFUL terminal block
+write_record() {  # sid held status next -> a signoff record for the session (v5.3: what the Stop hook reads instead of the chat)
+  $PY - "$1" "$2" "$3" "$4" <<'PYR'
+import sys
+sys.path.insert(0, "_skill/lib")
+import lifecycle as lc
+sid, held, status, nxt = sys.argv[1:5]
+lc.write_signoff_record(sid, status=status, held=held, next_=nxt, closing="Nothing needed from you.")
+PYR
+}
+hook_stop() {  # sid prompt_id [held=none] [status=done] [next] -> Stop guard after a TRUTHFUL signoff record; the message is plain prose
   local sid="$1" pid="$2" held="${3:-none}" status="${4:-done}" next="${5:-python scripts/board.py menu}"
-  hook_stop_text "$sid" "$pid" "$(printf 'work done.\n\nstatus: %s\nheld:   %s\nnext:   %s' "$status" "$held" "$next")"; return $LAST_RC
+  write_record "$sid" "$held" "$status" "$next"
+  hook_stop_text "$sid" "$pid" "work done. Nothing needed from you."; return $LAST_RC
 }
 commit_as() { local sid="$1"; shift; LAST_OUT=$(CLAUDE_CODE_SESSION_ID="$sid" git commit -q -m "$*" 2>&1); LAST_RC=$?; return $LAST_RC; }
 first_line() { printf '%s' "$1" | grep -m1 -E '\[require_lock\]|\[require_signoff\]|\[lock-guard\]|\[folder-lock\]|LOCKED|AGENT HOLDS|SIGNING OFF|REFUSED|RELEASED|CLAIMED|WIRING|READER|RULES|PARTIAL|READ IN FULL' || printf '%s' "$1" | head -1; }
@@ -241,7 +251,7 @@ o21a=$(CLAUDE_CODE_SESSION_ID=sess-r $LOCK reader --hint menu 2>&1); r21a=$?
 o21w=$(CLAUDE_CODE_SESSION_ID=sess-r $LOCK whoami 2>&1); r21w=$?
 hook_edit sess-r fixture/f.txt; r21b=$LAST_RC; o21b="$LAST_OUT"
 hook_stop sess-r p21; r21c=$LAST_RC; o21c="$LAST_OUT"
-GL="$FLSTATE/guard_log.jsonl"; n21c=$(grep -c '"session_id": "sess-r".*"state": "unclaimed".*"decision": "pass".*terminal block ok' "$GL" 2>/dev/null | tail -1); n21c=${n21c:-0}
+GL="$FLSTATE/guard_log.jsonl"; n21c=$(grep -c '"session_id": "sess-r".*"state": "unclaimed".*"decision": "pass".*signoff record ok' "$GL" 2>/dev/null | tail -1); n21c=${n21c:-0}
 o21d=$(CLAUDE_CODE_SESSION_ID=sess-r $LOCK claim fixture --task "R claims fixture after browsing" --hint window-r 2>&1); r21d=$?
 WIN_R=$(CLAUDE_CODE_SESSION_ID=sess-r $LOCK whoami | sed -n 's/^window=\([^ ]*\).*/\1/p')
 ok=0; [ $r21a -eq 0 ] && grep -q "^READER menu-" <<<"$o21a" && grep -q "^READER menu-" <<<"$o21w" \
@@ -292,16 +302,16 @@ git worktree remove --force "$WT" >>"$TR" 2>&1 || true
 NEW="$PY _skill/scripts/new.py"; SIGNOFF="$PY _skill/scripts/signoff.py"
 git add .folder-lock/registry.yaml 2>/dev/null; ICM_LOCK_BYPASS=1 MAIN_COMMIT_OK=1 git commit -q -m "registry tracked (setup)" >/dev/null 2>&1
 
-section "25. [acceptance 1] UNCLAIMED session ends WITHOUT the block -> Stop blocks; signoff.py --held none prints held: none; Stop with that block passes; untruthful held: blocked"
+section "25. [acceptance 1] UNCLAIMED session ends WITHOUT a signoff record -> Stop blocks; signoff.py --held none writes the record (held: none) + the closing message; Stop then passes on plain prose; a record that lies about the lock -> blocked"
 hook_stop_text sess-t25 p25a "all done, closing the window."; r25a=$LAST_RC; o25a="$LAST_OUT"
 o25b=$(CLAUDE_CODE_SESSION_ID=sess-t25 $SIGNOFF --held none --decisions "browsing only, nothing claimed" 2>&1); r25b=$?
-BLK25=$(printf '%s\n' "$o25b" | tail -3)
-hook_stop_text sess-t25 p25b "$(printf 'summary of the session.\n\n%s' "$BLK25")"; r25c=$LAST_RC
-hook_stop_text sess-t25 p25c "$(printf 'lying about the lock.\n\nstatus: done\nheld:   fixture\nnext:   x')"; r25d=$LAST_RC; o25d="$LAST_OUT"
-ok=0; [ $r25a -ne 0 ] && grep -q "every session ends with a terminal block" <<<"$o25a" && [ $r25b -eq 0 ] && grep -q "^held:   none" <<<"$o25b" \
-  && [ $r25c -eq 0 ] && [ $r25d -ne 0 ] && grep -q "holds no fresh lock" <<<"$o25d" && ok=1
-LAST_OUT="no block: exit $r25a | signoff --held none: exit $r25b, block: $(printf '%s' "$BLK25" | tr '\n' '|') | Stop with block: exit $r25c | Stop claiming held: fixture: exit $r25d"
-record 25 $ok "terminal block: missing -> blocked; signoff.py --held none -> held: none; truthful block passes; untruthful held: blocked"
+hook_stop_text sess-t25 p25b "summary of the session. Nothing needed from you."; r25c=$LAST_RC
+write_record sess-t25 fixture done x
+hook_stop_text sess-t25 p25c "lying about the lock."; r25d=$LAST_RC; o25d="$LAST_OUT"
+ok=0; [ $r25a -ne 0 ] && grep -q "no signoff record" <<<"$o25a" && [ $r25b -eq 0 ] && grep -q "^held:   none" <<<"$o25b" && grep -q "Nothing needed from you" <<<"$o25b" \
+  && grep -q "terminal block (written to the signoff record" <<<"$o25b" && [ $r25c -eq 0 ] && [ $r25d -ne 0 ] && grep -q "holds no fresh lock" <<<"$o25d" && ok=1
+LAST_OUT="no record: exit $r25a | signoff --held none: exit $r25b (record held: none, closing message present) | Stop on prose: exit $r25c | record claiming held: fixture: exit $r25d"
+record 25 $ok "signoff record: missing -> blocked; signoff.py --held none -> record held: none + closing message; plain prose passes; untruthful record blocked"
 
 section "26. [acceptance 2] blank window: SessionStart binds a fresh reader window + forces the triage; a Write before any claim -> denied"
 o26a=$(printf '{"session_id":"sess-t26","hook_event_name":"SessionStart","source":"startup"}' | CLAUDE_CODE_SESSION_ID=sess-t26 $PY .githooks/session_start.py 2>&1); r26a=$?
@@ -367,16 +377,18 @@ LAST_OUT="Edit other/o.txt: exit $r30a (handoff.py named, held: $(grep -o 'you h
 record 30 $ok "write scope while holding test-lane: Edit + shell redirection into another folder denied (handoff.py named); own folder, drop zone, outside repo pass"
 CLAUDE_CODE_SESSION_ID=sess-t29 $LOCK release test-lane --allow-dirty "fixture test" >>"$TR" 2>&1
 
-section "31. [acceptance 7] headless (loop-fired) session: SessionStart shows NO triage; Stop still enforces the block (held must be the fired folder; trailing DONE tolerated)"
+section "31. [acceptance 7] headless (loop-fired) session: SessionStart shows NO triage; Stop still enforces the signoff record (held must be the fired folder; the reply is prose + DONE)"
 printf 'holder: fired\nwindow: "fired-agent-260911-t31x"\nstatus: open\ntask: "autorun fixture"\nstream: "fixture"\nbranch: "main"\nstarted: "%s"\n' "$(date +%Y-%m-%dT%H:%M)" > fixture/.goal/.firing.lock
 o31a=$(printf '{"session_id":"sess-t31","hook_event_name":"SessionStart","source":"startup"}' | ICM_WINDOW=fired-agent-260911-t31x ICM_FOLDER=fixture $PY .githooks/session_start.py 2>&1); r31a=$?
 ICM_WINDOW=fired-agent-260911-t31x ICM_FOLDER=fixture hook_stop_text sess-t31 p31a "$(printf 'item worked.\nDONE')"; r31b=$LAST_RC; o31b="$LAST_OUT"
-ICM_WINDOW=fired-agent-260911-t31x ICM_FOLDER=fixture hook_stop_text sess-t31 p31b "$(printf 'item worked.\n\nstatus: done\nheld:   none\nnext:   x\nDONE')"; r31c=$LAST_RC; o31c="$LAST_OUT"
-ICM_WINDOW=fired-agent-260911-t31x ICM_FOLDER=fixture hook_stop_text sess-t31 p31c "$(printf 'item worked.\n\nstatus: done\nheld:   fixture\nnext:   python scripts/signoff.py\nDONE')"; r31d=$LAST_RC
+write_record sess-t31 none done x
+ICM_WINDOW=fired-agent-260911-t31x ICM_FOLDER=fixture hook_stop_text sess-t31 p31b "$(printf 'item worked.\nDONE')"; r31c=$LAST_RC; o31c="$LAST_OUT"
+write_record sess-t31 fixture done "python scripts/signoff.py"
+ICM_WINDOW=fired-agent-260911-t31x ICM_FOLDER=fixture hook_stop_text sess-t31 p31c "$(printf 'item worked. Nothing needed from you.\nDONE')"; r31d=$LAST_RC
 ok=0; [ $r31a -eq 0 ] && grep -q "HEADLESS AGENT fired-agent-260911-t31x: no triage" <<<"$o31a" && ! grep -q "FIRST ACTION — TRIAGE" <<<"$o31a" \
-  && [ $r31b -ne 0 ] && grep -q "every session ends with a terminal block" <<<"$o31b" && [ $r31c -ne 0 ] && grep -q "still holds fixture" <<<"$o31c" && [ $r31d -eq 0 ] && ok=1
-LAST_OUT="SessionStart: headless line present, triage absent | Stop 'DONE' only: exit $r31b | Stop held: none while .firing.lock fresh: exit $r31c | Stop held: fixture + DONE: exit $r31d"
-record 31 $ok "headless agent: no triage prompt; Stop blocks without the block and on an untruthful held:, passes with held: fixture + the DONE line"
+  && [ $r31b -ne 0 ] && grep -q "no signoff record" <<<"$o31b" && [ $r31c -ne 0 ] && grep -q "still holds fixture" <<<"$o31c" && [ $r31d -eq 0 ] && ok=1
+LAST_OUT="SessionStart: headless line present, triage absent | Stop without record: exit $r31b | Stop record held: none while .firing.lock fresh: exit $r31c | Stop record held: fixture + DONE: exit $r31d"
+record 31 $ok "headless agent: no triage prompt; Stop blocks without a record and on an untruthful held, passes with a record held: fixture + the DONE line"
 rm -f fixture/.goal/.firing.lock
 
 

@@ -6,7 +6,11 @@ Report-only: never modifies a lock or a file.
 
 Two rules, both mechanical, both from lib/lifecycle.py (the same module the write guards use):
 
-  A. TERMINAL BLOCK (§17). The final assistant message must END with the three-line block
+  A. SIGNOFF RECORD (§17, v5.3). The turn must have run the signoff — `scripts/signoff.py` (full) or
+     `scripts/signoff.py --turn` (mid-task) — which writes `<sessions>/<sid>.signoff.json` carrying the
+     terminal block as data. The record must be from THIS turn (written at or after the last human prompt)
+     and its `held` must agree with the locks on disk. The chat itself is not inspected: it carries only the
+     closing message for the owner. Legacy rule for reference — the block used to be required in the message:
         status: done | blocked | handed-off
         held:   <folder> | none
         next:   <exact command> | none — waiting on the owner
@@ -40,7 +44,9 @@ for _c in (HERE / "lib", HERE.parent / "lib"):
         break
 
 MAX_BLOCKS = 2
-SIGNOFF_HINT = "run the signoff (scripts/signoff.py) — every session ends with a terminal block"
+SIGNOFF_HINT = ("run the signoff — every turn ends through `python scripts/signoff.py` (full) or "
+                "`python scripts/signoff.py --turn` (mid-task, ending on a question to the owner); "
+                "the hook reads the signoff RECORD it writes, the chat shows only the closing message")
 
 
 def _out(block: bool, reason: str, ctx: dict) -> int:
@@ -88,14 +94,14 @@ def _closing_problems(me, folders: list) -> list:
             ptr = lp.ROOT / f / "workflow-state" / "current-pointer.md"
             if not ptr.is_file():
                 problems.append(f"{f}: lock is `closing` but {f}/workflow-state/current-pointer.md does not exist — "
-                                f"write it (signoff step 2b), commit, then `python scriptsthe signoff (scripts/signoff.py).py` (it releases)")
+                                f"write it (signoff step 2b), commit, then `python scripts/signoff.py` (it releases)")
             elif li.started and datetime.fromtimestamp(ptr.stat().st_mtime) < li.started:
                 problems.append(f"{f}: lock is `closing` but the pointer was last written "
                                 f"{datetime.fromtimestamp(ptr.stat().st_mtime).strftime(lp.TS_FMT)}, before the lock start "
                                 f"{li.started.strftime(lp.TS_FMT)} — update current-pointer.md (signoff step 2b), commit, release")
             else:
                 problems.append(f"{f}: lock is `closing`, pointer is updated, but LOCK.yaml still exists — finish signoff: "
-                                f"commit as yourself, then `python scriptsthe signoff (scripts/signoff.py).py` (release + terminal block)")
+                                f"commit as yourself, then `python scripts/signoff.py` (release + record)")
     return problems
 
 
@@ -128,36 +134,40 @@ def main() -> int:
     me = st["identity"]
     ctx.update({"window": st["window"], "state": st["state"], "held": st["held"], "fired": st["fired"]})
 
-    # ---- A. terminal block -------------------------------------------------------------------------
-    text = lc.final_assistant_text(inp.get("transcript_path", ""))
-    if text is None:
-        return block_once(f"final assistant message not readable from transcript ({inp.get('transcript_path') or 'no path'}) — {SIGNOFF_HINT}")
-    blk = lc.parse_terminal_block(text)
-    if blk is None:
-        return block_once(f"{SIGNOFF_HINT}. Final message must END with exactly:\n"
-                          f"status: done | blocked | handed-off\nheld:   <folder> | none\nnext:   <exact command> | none — waiting on the owner\n"
-                          f"(this session: state={st['state']}, held={', '.join(st['held']) or 'none'} — "
-                          f"`python scriptsthe signoff (scripts/signoff.py).py` computes and prints the block)")
-    ctx["block"] = {"status": blk["status"], "held": blk["held"], "next": blk["next"][:120]}
+    # ---- A. signoff record (v5.3, two-output contract) ----------------------------------------------
+    # The proof that a turn ended properly is the RECORD signoff.py wrote during this turn — not the
+    # prose of the final message. The chat carries only the closing message (what waits on the owner,
+    # answers to the owner's questions); the terminal block lives in the record and in the pointer.
+    tr_path = inp.get("transcript_path", "")
+    rec = lc.read_signoff_record(sid)
+    if rec is None:
+        return block_once(f"{SIGNOFF_HINT} — no signoff record for this session "
+                          f"(state={st['state']}, held={', '.join(st['held']) or 'none'})")
+    if not lc.record_covers_turn(rec, tr_path):
+        return block_once(f"{SIGNOFF_HINT} — the last signoff record predates this turn's prompt "
+                          f"(kind {rec.get('kind')}, status {rec.get('status')}); run it again for this turn")
+    blk = {"status": rec["status"], "held": rec.get("held", "none"), "held_list": rec.get("held_list", []),
+           "next": rec.get("next", "")}
+    ctx["block"] = {"status": blk["status"], "held": blk["held"], "next": blk["next"][:120], "kind": rec.get("kind")}
     held_disk = set(st["held"])
     held_said = set(blk["held_list"])
     if held_said != held_disk:
         if held_said and not held_disk:
-            return block_once(f"terminal block says held: {blk['held']} but this window holds no fresh lock — "
-                              f"write `held: none` (or re-claim if the lock expired)")
+            return block_once(f"signoff record says held: {blk['held']} but this window holds no fresh lock — "
+                              f"run the signoff again (or re-claim if the lock expired)")
         if held_disk and not held_said:
-            return block_once(f"terminal block says held: none but this window still holds {', '.join(sorted(held_disk))} — "
-                              f"either release through the signoff (scripts/signoff.py) (python scriptsthe signoff (scripts/signoff.py).py) or write `held: {', '.join(sorted(held_disk))}`")
-        return block_once(f"terminal block held: {blk['held']} does not match the locks on disk ({', '.join(sorted(held_disk))}) — fix the line")
+            return block_once(f"signoff record says held: none but this window still holds {', '.join(sorted(held_disk))} — "
+                              f"release through `python scripts/signoff.py`, or end the turn with `python scripts/signoff.py --turn`")
+        return block_once(f"signoff record held: {blk['held']} does not match the locks on disk ({', '.join(sorted(held_disk))}) — run the signoff again")
 
     # ---- B. closing lock (§9) ----------------------------------------------------------------------
     if me is not None and not st["reader"]:
         problems = _closing_problems(me, lc.candidate_folders(sid))
         if problems:
             return block_once("cannot end the turn holding a closing lock. " + " | ".join(problems) +
-                              " — run the the signoff (scripts/signoff.py) skill now (it is agent-initiated).")
+                              " — run the signoff (scripts/signoff.py) now (it is agent-initiated).")
 
-    return _out(False, f"terminal block ok ({blk['status']}, held {blk['held']}); no closing lock", ctx)
+    return _out(False, f"signoff record ok ({rec.get('kind')}: {blk['status']}, held {blk['held']}); no closing lock", ctx)
 
 
 if __name__ == "__main__":
