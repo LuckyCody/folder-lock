@@ -421,6 +421,16 @@ def cmd_release(a) -> int:
         problems.append(f"no pointer: {ptr.relative_to(ROOT).as_posix()} does not exist — write it (PROTOCOL §3)")
     elif li.started and datetime.fromtimestamp(ptr.stat().st_mtime) < li.started:
         problems.append(f"pointer not updated since lock start {li.started.strftime(lp.TS_FMT)}: {ptr.relative_to(ROOT).as_posix()}")
+    # §18 (v5.4): the foreground guard — same verdict signoff.py gives, so a bare release cannot walk past it
+    if not me.window.lower().startswith("fired-"):
+        try:
+            import channel as _ch
+            import items as _items
+            import lifecycle as _lc
+            held_now = _lc.session_state(_sid()).get("held") or [home]
+            problems.extend(_ch.window_item_guard(me.window, held_now, _items.load()))
+        except Exception as e:  # noqa: BLE001
+            print(f"note: foreground guard not evaluated ({e})")
     staged = _session_handoffs()
     idx = None
     if staged:

@@ -29,6 +29,7 @@ import lockpath as lp  # noqa: E402
 import items  # noqa: E402
 import autorun_log as alog  # noqa: E402
 import mint  # noqa: E402
+import channel  # noqa: E402  (v5.4, PROTOCOL §18: foreground items are fired directly, never swept)
 
 ROOT = lp.ROOT
 SKIP = {".git", "node_modules", ".venv", "venv", "__pycache__", ".next", "dist", "build", ".githooks"}
@@ -123,6 +124,8 @@ def autorun(runner: str, owner_prefix: str = "", once: bool = False, timeout: in
         totals["passes"] += 1
         items.sync(scan())
         ready = [it for it in items.ready_items() if not owner_prefix or it["owner"].startswith(owner_prefix)]
+        # §18 (v5.4): foreground items are fired by `--fire-direct` at mint time, never swept
+        ready = [it for it in ready if channel.channel_of(it) != channel.WINDOW]
         if not ready:
             log("autorun: queue empty — nothing left that an agent may do"); break
         by_owner: dict = {}
@@ -171,15 +174,60 @@ def autorun(runner: str, owner_prefix: str = "", once: bool = False, timeout: in
     return totals
 
 
+def fire_direct(runner: str, key: str, tier: str = "", timeout: int = 3600) -> str:
+    """§18 (v5.4): fire ONE foreground item now — no sweep, no coalescing, the window's tier (`AUTORUN_TIER` for the
+    runner), no chain. Held by another interactive session → `waiting_on_cody` (one sentence), never queued."""
+    e = items.load()["items"].get(key)
+    if not e:
+        log(f"fire_direct: unknown item {key}"); return "not_ready"
+    if channel.channel_of(e) != channel.WINDOW:
+        log(f"fire_direct REFUSED {key}: background item — the sweep owns it"); return "not_ready"
+    if e.get("status") != "ready":
+        log(f"fire_direct: {key} is {e.get('status')}, not ready"); return "not_ready"
+    owner = e.get("owner") or key.split("|", 1)[0]
+    reason = folder_locked(owner)
+    if reason:
+        if reason.startswith("LOCK.yaml"):
+            sentence = f"{owner} is held by another interactive session ({reason}); the owner decides when this fires."
+            items.set_waiting_on_cody(key, sentence); log(f"fire_direct HELD {key}: {sentence}")
+            return "waiting_on_cody"
+        log(f"fire_direct: {owner} busy ({reason}) — {key} stays ready, retry the direct fire"); return "locked"
+    item = dict(key=key, **e)
+    items.set_status(key, "in_progress")
+    agent_id = set_firing_lock(owner, key)
+    env = {"ICM_WINDOW": agent_id, "ICM_FOLDER": owner, "AUTORUN_ITEM": key, "AUTORUN_ITEM_KIND": item["kind"],
+           "AUTORUN_ITEM_REF": item["ref"], "AUTORUN_ITEM_TITLE": item.get("title", ""), "ICM_ORIGIN_CHANNEL": "background"}
+    if tier:
+        env["AUTORUN_TIER"] = tier
+    log(f"FIRE DIRECT {owner} :: {item.get('title', '')[:80]} as {agent_id} (tier {tier or 'runner default'}, foreground)")
+    try:
+        res = run_runner(runner, prompt_for(owner, item, agent_id), env, timeout)
+    finally:
+        (lp.LOCK_TREE / owner / ".goal" / ".firing.lock").unlink(missing_ok=True)
+    if res.get("_error"):
+        items.set_status(key, "ready"); log(f"  INFRA ERROR — {key} back to ready: {res['_error'][:160]}"); return "infra"
+    st = items.load()["items"].get(key, {}).get("status", "?")
+    if st == "in_progress":
+        items.set_status(key, "ready"); st = "ready"
+    log(f"  item -> {st}")
+    return st
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="folder-lock autorun loop (PROTOCOL §13)")
     ap.add_argument("--runner", default=os.environ.get("AUTORUN_RUNNER", ""), help="command that plays the fired agent (reads the prompt on stdin)")
     ap.add_argument("--once", action="store_true"); ap.add_argument("--owner-prefix", default="")
     ap.add_argument("--timeout", type=int, default=3600); ap.add_argument("--detach", action="store_true")
+    ap.add_argument("--fire-direct", default="", metavar="ITEM_KEY", help="§18: fire THIS foreground item now and exit")
+    ap.add_argument("--tier", default="", help="--fire-direct: the originating window's tier (exported as AUTORUN_TIER)")
     a = ap.parse_args()
     if not a.runner:
         print("ERROR: --runner (or AUTORUN_RUNNER) is required, e.g. --runner \"claude --print --permission-mode acceptEdits\"", file=sys.stderr)
         return 2
+    if a.fire_direct:
+        res = fire_direct(a.runner, a.fire_direct, a.tier, a.timeout)
+        print(f"fire_direct {a.fire_direct}: {res}")
+        return 0 if res not in ("not_ready", "infra") else 3
     if a.detach:
         argv = [x for x in sys.argv[1:] if x != "--detach"]
         kw = {"cwd": str(ROOT), "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}

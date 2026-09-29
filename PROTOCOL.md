@@ -251,3 +251,18 @@ Several interactive sessions run on one machine at once and can address each oth
 **One verdict function.** `lifecycle.write_verdict(rel, identity, session)` → `(allow, reason, code)` with codes `OWN | EXCEPTION | ARCHIVED | DROP-HELD | NO-IDENTITY | READER | UNGUARDED | FOREIGN | STALE | UNCLAIMED | MALFORMED`. The edit guard, the shell guard and the commit guard call it; `python lib/lifecycle.py verdict <path>` shows what they would say. Proof: `bash tests/conflict_run.sh` scenarios 25–31 (terminal block, blank-window triage, `new.py`, archive, unarchive, write scope, fired agent) — 31/31.
 
 **Public twin.** The generic parts — signoff-record Stop hook, SessionStart triage, write guards, `new.py` template + `new.py`, archive flow in `signoff.py`, `lib/lifecycle.py` — live in `github.com/Luckythe owner/folder-lock` (v5.0.0) without workspace paths or board coupling; the board-derived `status:`/`next:` computation is this instance's.
+
+## 18. Foreground vs. background — window work runs now, never via the queue [v5.4]
+
+**Why.** An interactive session's follow-ups (handoffs, cross-folder repairs) used to enter the loop's queue and wait for the sweep, its cheap tier and its fail-up chain — the owner's active work paced by the machine's backlog. The queue is for harness/loop work and board answers; the owner's window is foreground (owner ruling 2026-09-29).
+
+**Origin channel.** Every item/handoff carries `origin_channel`: `window` = minted from an interactive session (a bound `ICM_WINDOW` that is not `fired-*` and no `ICM_FOLDER` export); `background` = the autorun loop, tripwires, procedures, board answers (`board.py answer`, buttons and `--batch` alike). Derived at mint time by `lib/channel.py origin_channel`; persisted on the item (`origin_channel`, `minted_by`) and in the note's front matter. The owner's spoken "push this to the queue" = the agent mints with `--channel background` (or `ICM_ORIGIN_CHANNEL=background`); no flag for the default.
+
+**`window` — foreground.**
+- Target folder == a folder the window holds → no item round-trip: `handoff.py` refuses (rc 12) and the session continues the work itself.
+- Target folder != current → an immediate direct fire: `scripts/autorun.py --fire-direct <key> --tier <window tier>` spawned detached at mint. Not enqueued (the sweep filters window items out), no coalescing, tier = the originating window's (`AUTORUN_TIER`; else the CLI's configured model mapped fable→critical, opus→default, sonnet→routine), no fail-up chain, exempt from any "no re-fire while a PR is open" loop gate.
+- Folder locks apply as today. Target held by ANOTHER interactive session → `waiting_on_cody: "<one plain sentence>"` on the item (`lib/items.py waiting-on-cody`), never queued.
+
+**`background` — unchanged.** The queue, the loop's default tier, its chain, its gates.
+
+**Signoff guard (interactive sessions only).** `scripts/signoff.py` (exit 9) and `scripts/lock.py release` (exit 6) refuse while a window item minted by this window is `ready`/`in_progress` in a folder the window holds, or `ready` in another folder without `fired_at` / `waiting_on_cody`. Allowed exits: the item is done, it carries `waiting_on_cody`, or its direct fire has claimed it. Same-folder remainder may not be minted as a handoff to escape the guard — the mint refuses it. Fired sessions keep §9/§17 as before.

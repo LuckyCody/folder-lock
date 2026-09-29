@@ -308,6 +308,20 @@ def main() -> int:
         print(f"ERROR: {folder} is not held by this window ({', '.join(held) or 'nothing'})", file=sys.stderr)
         return 2
     me = st["identity"]
+    # §18 (v5.4): an INTERACTIVE session may not end while a foreground item it minted is still open here
+    if not st.get("fired"):
+        import channel as _ch
+        import items as _items
+        try:
+            guard = _ch.window_item_guard(me.window, held, _items.load())
+        except Exception as e:  # noqa: BLE001 — an unreadable store must not invent a refusal
+            guard = []
+            print(f"note: foreground guard not evaluated ({e})")
+        if guard:
+            print("SIGNOFF REFUSED — foreground work of this window is still open (PROTOCOL §18):", file=sys.stderr)
+            for g in guard:
+                print(f"  - {g}", file=sys.stderr)
+            return 9
     ts = mint.timestamp()
     sha = a.commit or _git("rev-parse", "--short", "HEAD").stdout.strip()
     print(f"signoff {folder} · window {me.window} · commit {sha}")

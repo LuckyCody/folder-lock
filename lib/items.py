@@ -188,7 +188,10 @@ def _apply_status(e: dict, status: str, question: str | None, now: str) -> None:
 
 
 def upsert(folder: str, kind: str, ref: str, title: str, created_by: str = "", status: str = "ready",
-           question: str | None = None, force: bool = False) -> str:
+           question: str | None = None, force: bool = False, origin_channel: str | None = None,
+           minted_by: str | None = None) -> str:
+    """`origin_channel` (v5.4, PROTOCOL §18): window | background — stamped on a NEW item, an explicit value wins on a
+    refresh; `minted_by` = the window that minted it (the signoff guard reads both). Absent = background."""
     data = load()
     folder = folder.replace("\\", "/").strip("/")
     owner = owner_of(folder)
@@ -205,10 +208,28 @@ def upsert(folder: str, kind: str, ref: str, title: str, created_by: str = "", s
     e.update({"owner": owner, "kind": kind, "ref": ref.replace("\\", "/"), "title": (title or "")[:300], "updated": now})
     if created_by:
         e["created_by"] = created_by.replace("\\", "/").strip("/")
+    ch = str(origin_channel or "").strip().lower()
+    if ch in ("window", "background"):
+        e["origin_channel"] = ch
+    if minted_by and "minted_by" not in e:
+        e["minted_by"] = str(minted_by)
     _apply_status(e, status, question, now)
     data["items"][k] = e
     save(data)
     return k
+
+
+def set_waiting_on_cody(key: str, sentence: str) -> dict:
+    """A FOREGROUND item that cannot fire now (its folder is held by another interactive session) — one plain
+    sentence, the status untouched; the signoff guard and the board read it (PROTOCOL §18)."""
+    data = load()
+    e = data["items"].get(key)
+    if e is None:
+        raise KeyError(f"unknown item {key!r}")
+    e["waiting_on_cody"] = " ".join(str(sentence or "").split())[:300] or "waiting on the owner"
+    e["updated"] = mint.timestamp()
+    save(data)
+    return e
 
 
 def set_status(key: str, status: str, question: str | None = None, error: str | None = None) -> dict:
@@ -483,6 +504,8 @@ def _cli(argv: list[str]) -> int:
     for name in ("ready", "in-progress", "done"):
         p = sub.add_parser(name); p.add_argument("key"); p.add_argument("--error", default=None)
     w = sub.add_parser("wait"); w.add_argument("key"); w.add_argument("--question", required=True)
+    wc = sub.add_parser("waiting-on-cody", help="v5.4: a foreground item that cannot fire now — one plain sentence, status untouched")
+    wc.add_argument("key"); wc.add_argument("sentence")
     an = sub.add_parser("answer"); an.add_argument("key"); an.add_argument("--text", required=True)
     an.add_argument("--note-ref", default=""); an.add_argument("--by", default="")
     fp = sub.add_parser("from-pointer"); fp.add_argument("folder"); fp.add_argument("--created-by", default="")
@@ -510,6 +533,10 @@ def _cli(argv: list[str]) -> int:
             print(f"DUPLICATE: {d} — not created", file=sys.stderr); return 4
     if a.cmd in ("ready", "in-progress", "done"):
         set_status(a.key, a.cmd.replace("-", "_"), error=a.error); print(f"{a.key} -> {a.cmd.replace('-', '_')}"); return 0
+    if a.cmd == "waiting-on-cody":
+        e = set_waiting_on_cody(a.key, a.sentence)
+        print(f"{a.key}: waiting_on_cody = {e['waiting_on_cody']}")
+        return 0
     if a.cmd == "wait":
         set_status(a.key, "waiting_owner", question=a.question); print(f"{a.key} -> waiting_owner"); return 0
     if a.cmd == "answer":

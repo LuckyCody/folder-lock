@@ -75,7 +75,14 @@ def main(argv=None) -> int:
                     help="what the note IS to the receiving folder: task (work it) | report (read it) | answer (a ruling)")
     ap.add_argument("--from", dest="source", default=""); ap.add_argument("--body", default="")
     ap.add_argument("--force", action="store_true", help="owner-only: bypass the §13 dedup")
+    ap.add_argument("--channel", choices=["window", "background"], default="",
+                    help="v5.4 (PROTOCOL §18): derived when omitted — `window` from an interactive session (fires NOW), "
+                         "`background` from the loop / answers (queued). Pass `background` when the owner says "
+                         "\"push this to the queue\".")
     a = ap.parse_args(argv)
+    import channel as _ch
+    sid0 = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    chan = a.channel or ("background" if a.ntype == "answer" else _ch.origin_channel(session_id=sid0))
     target_rel = a.to.replace("\\", "/").strip("/")
     target = lp.LOCK_TREE / target_rel if target_rel not in ("", ".") else lp.LOCK_TREE   # v4.3: notes live in the lock tree
     target_rel = target_rel or "."
@@ -92,6 +99,25 @@ def main(argv=None) -> int:
     if mode == "fire" and goal_status(target) == "in_progress":
         print(f"WARN: {target_rel}/.goal/state.yaml is in_progress - staging instead of firing (never clobber a live goal).")
         mode = "stage"
+    # §18: a WINDOW item aimed at a folder this window holds is not a handoff — the session does the work itself
+    me_window = ""
+    if chan == "window" and a.ntype == "task":
+        try:
+            import lifecycle as _lc
+            st = _lc.session_state(sid0)
+            me_window = st.get("window") or ""
+            held = {h.replace("\\", "/").strip("/") for h in st.get("held") or []}
+            # the target's own slot, for an env-only identity with no session binding (a plain terminal)
+            if me_window and any(li.fresh and lp.same_window(li.window, me_window)
+                                 for li in lp.locks_at(target / ".goal")):
+                held.add(target_rel)
+            if target_rel in held:
+                print(f"REFUSED: {target_rel} is held by THIS window — foreground work continues here, not through an "
+                      f"item (PROTOCOL §18). The owner's word \"push it to the queue\" = --channel background.", file=sys.stderr)
+                return _ch.RC_SAME_FOLDER
+        except lp.IdentityConflict as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 5
     body = sys.stdin.read() if a.body == "-" else (Path(a.body).read_text(encoding="utf-8") if a.body else "")
     now = mint.now()
     # dedup (PROTOCOL §13): a handoff IS a board item — no second open item with the same owner + title
@@ -106,7 +132,7 @@ def main(argv=None) -> int:
     note = inbox / f"{mint.handoff(a.task, now)}.{'staged' if mode == 'stage' else 'fired'}.md"
     note.write_text(
         f"---\nmode: {mode}\ntype: {a.ntype}\ntask: {_yaml_str(a.task)}\nfrom: \"{a.source}\"\nto: \"{target_rel}\"\n"
-        f"written: \"{mint.timestamp(now)}\"\n---\n\n# Handoff: {a.task}\n\n"
+        f"written: \"{mint.timestamp(now)}\"\norigin_channel: \"{chan}\"\n---\n\n# Handoff: {a.task}\n\n"
         f"{body.strip() or '(no body - the task line is the whole spec)'}\n\n"
         f"Consuming this handoff means doing the task (or filing it into this folder's workflow-state), "
         f"recording the outcome in this folder's progress/log, and deleting this file.\n", encoding="utf-8")
@@ -114,7 +140,9 @@ def main(argv=None) -> int:
     _register_inbox(target_rel)
     try:
         # an `answer`/`report` note is FILED: read by the folder next fire, never fired on its own (v5.2)
-        _items.upsert(target_rel, "handoff", note.name, a.task, created_by=a.source or "dispatcher", status="filed" if a.ntype in ("answer", "report") else "ready", force=True)
+        _items.upsert(target_rel, "handoff", note.name, a.task, created_by=a.source or "dispatcher",
+                      status="filed" if a.ntype in ("answer", "report") else "ready", force=True,
+                      origin_channel=chan, minted_by=me_window or None)
     except Exception as _e:
         print(f"(item not recorded: {_e})", file=sys.stderr)
     try:                      # every state writer rebuilds the materialized board (v5.2)
@@ -132,8 +160,12 @@ def main(argv=None) -> int:
         print(f"FIRED: {lp.lock_rel(note)} + .goal/state.yaml (your headless runner picks it up)")
     elif a.ntype in ("answer", "report"):
         print(f"FILED ({a.ntype}): {lp.lock_rel(note)} (read by {target_rel} next fire - it does NOT kick)")
+    elif chan == "window":
+        # §18: foreground — the direct fire starts now; the sweep never sees this item
+        key = f"{target_rel}|handoff|{note.name}"
+        print(f"STAGED: {lp.lock_rel(note)} · " + _ch.dispatch_direct(key, _ch.window_tier(), HERE / "autorun.py", ROOT))
     else:
-        print(f"STAGED: {lp.lock_rel(note)} (read by whoever next claims {target_rel})")
+        print(f"STAGED: {lp.lock_rel(note)} (read by whoever next claims {target_rel}; the loop's queue)")
     return 0
 
 
