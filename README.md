@@ -105,6 +105,16 @@ The board used to be derived live on every look — a full tree walk, `items.syn
 - **Env fuse** (`lib/statestore.py`): `_container()` refuses the live blob container unless the PROCESS ENVIRONMENT names `FOLDER_LOCK_STATE_BACKEND=blob` — a test once monkeypatched `statestore.BACKEND = "blob"` and one render reached the live store (14 real items closed); the environment is the witness an attribute cannot fake. `items._live_store()` is the ONE predicate the destructive resurrected-note deletion asks.
 - **Tests**: `tests/test_board_materialize.py` (13 checks, plain `python` or pytest) — materialize shape + `<!-- answer: <handle> -->` anchors, the fresh-glance budget (ONE raw GET, the `items` etag check, ONE write), stale fallback, idempotency + concurrent writers, the resurrected digest, the lockless answer + batch parser, and the env fuse.
 
+## What's new in v5.5
+
+**Lock record v2 — read mode as protocol, write-sets, a self-repairing registry** (PROTOCOL §1, ported from the workspace's lock registry v2, 2026-10-02).
+
+- **Read mode is the default.** A session with no lock is in `read` mode: it never takes a lock, never waits, never gets blocked — and every write it attempts is refused by the edit, shell and commit guards with ONE line that names the folder and the claim command (`lifecycle.read_mode_line`; `lifecycle.session_mode(sid)` answers `read | write`). `write` is obtained only by a successful claim. Headless READ runs (a report, an answer, an audit) take no `.firing.lock`, so a writer can claim the folder while they run.
+- **The lock record carries its own evidence:** `kind`, `session` (the bound session id — liveness is a SESSION fact, never a stored pid), `mode`, `state` (`held | stale_candidate | reclaimed`), `ttl_s` and a declared **`write_set`** (globs; default = the registry `owns:`). A wait ends with `outcome`, `waited_s` and a contention `class` (`true` = overlapping write-sets, `false` = disjoint — a split candidate, never a bypass).
+- **Stale = heartbeat past the ttl AND a POSITIVE dead-witness** (the session gone on the host that bound it, an exit marker, a signoff record, the runner's hand-back). "I cannot see the session" is ambiguous and judges nothing — the first live run of the workspace's reconciler reclaimed four live locks on exactly that fall-through, which is why the rule is written down here.
+- **A no-change release is a no-op, not a refusal:** no commit since the lock start, no dirty file, pointer untouched → `lock.py release` releases with a note. A lock that was only ever read under has nothing to prove.
+- **Events** for metrics (append-only, never read by a guard): `acquire · release · adopt · wait_start · wait_end · stale_detected · reclaimed · repair_minted · waiter_retired · read_session`.
+
 ## What's new in v5.4
 
 **Foreground vs. background routing (owner ruling 2026-09-29, PROTOCOL §18).** Work the owner starts in an interactive window used to go into the same queue as the loop's work and wait for the sweep. Now every item carries an `origin_channel`: `window` (minted from an interactive session — a bound window that is not `fired-*`) or `background` (the loop, tripwires, procedures, `board.py answer`). The channel is DERIVED (`lib/channel.py origin_channel`); `--channel background` / `ICM_ORIGIN_CHANNEL=background` is the owner's "push this to the queue".

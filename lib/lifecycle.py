@@ -288,6 +288,25 @@ def held_folders(me: Optional[lp.Identity], sid: str = "", env: Optional[dict] =
     return out
 
 
+# ── session mode (v5.5, PROTOCOL §1 lock record v2) ──────────────────────────────────────────────────────────────────
+MODE_READ, MODE_WRITE = "read", "write"
+CLAIM_CMD = 'python scripts/lock.py claim {f} --task "..."'
+
+
+def session_mode(sid: str = "", env: Optional[dict] = None) -> str:
+    """`write` when this session holds at least one fresh lock, else `read` — reads never take a lock, never wait."""
+    try:
+        return MODE_WRITE if session_state(sid, env).get("held") else MODE_READ
+    except Exception:  # noqa: BLE001
+        return MODE_READ
+
+
+def read_mode_line(rel: str, folder: str, why: str, tail: str = "") -> str:
+    """The ONE line a write in read mode gets: the folder, why, the claim command."""
+    f = folder or "<folder>"
+    return f"read mode: {rel} is in folder '{f}' — {why}; claim it to write: {CLAIM_CMD.format(f=f)}" + (f" {tail}" if tail else "")
+
+
 def session_state(sid: str = "", env: Optional[dict] = None) -> dict:
     """{state: unclaimed|claimed|signed-off, window, held: [folder...], fired: bool, reader: bool}.
     Raises lp.IdentityConflict (callers fail closed)."""
@@ -391,12 +410,11 @@ def _verdict(rel: str, me: Optional[lp.Identity], sid: str = "", mode: str = "ed
         return True, "workflow-state/ (§17 exception: resume record, writable unless the folder is held by another window)"
     # 5. identity — a session with no lock may write nothing else
     if me is None:
-        return False, (f"no lock held — with no lock a session may write only {INBOX}/ drops (and workflow-state/). "
-                       f"{rel} -> folder '{res.folder or 'root'}'. Triage first: scripts/board.py menu + scripts/lock.py claim (existing work) or scripts/new.py <slug> (new folder). "
-                       f"{lp.NO_IDENTITY_HELP}")
+        return False, read_mode_line(rel, res.folder or "root", f"no lock held (a session with no lock may write only {INBOX}/ drops and workflow-state/)",
+                                     tail="(triage first: scripts/board.py menu + scripts/lock.py claim, or scripts/new.py <slug>) " + " ".join(str(lp.NO_IDENTITY_HELP).split()))
     if is_reader(sid):
-        return False, (f"reader identity {me.window} (menu-only, no lock) may not write {rel}. Claim first: "
-                       f"scripts/lock.py claim <folder> or scripts/new.py <slug> (python scripts/lock.py claim {res.folder or '<folder>'} --task \"...\")")
+        return False, read_mode_line(rel, res.folder, f"reader identity {me.window} (menu-only, no lock) may not write",
+                                     tail="(or scripts/new.py <slug>)")
     if res.kind == "unguarded":
         return False, (f"unguarded folder for {rel}: '{res.folder}' is not in the registry and has no .goal/ — a folder without an "
                        f"owns: entry is not routable and must not exist. Scaffold + register + claim in one step: scripts/new.py <slug>. "
@@ -435,10 +453,8 @@ def _verdict(rel: str, me: Optional[lp.Identity], sid: str = "", mode: str = "ed
     if stale_mine:
         return False, (f"your lock on '{res.folder}' went stale ({stale_mine[0].describe()}); re-claim: "
                        f"python scripts/lock.py claim {res.folder} --task \"...\"")
-    return False, (f"{rel} is outside your held folder ({_held_line(me, sid)}): folder '{res.folder}' is free but not yours. "
-                   f"Writes outside the held folder are a boundary crossing (§2/§17) — stage a handoff: "
-                   + handoff.format(f=res.folder) + f" — or, if the owner's task spans both folders, claim it under the same window: "
-                   f"python scripts/lock.py claim {res.folder} --task \"...\"")
+    return False, read_mode_line(rel, res.folder, f"folder '{res.folder}' is free but not yours ({_held_line(me, sid)}; a write outside the held folder is a boundary crossing, §2/§17)",
+                                 tail="— or, if it is not your task, stage a handoff: " + handoff.format(f=res.folder))
 
 
 # ----------------------------------------------------------------------------

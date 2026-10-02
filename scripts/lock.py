@@ -267,12 +267,43 @@ def bind_reader(sid: str, hint: str = "menu") -> str:
     return window
 
 
+INTERACTIVE_TTL_S = 900          # v5.5: a silent heartbeat past this makes the record a stale_candidate (never a verdict by itself)
+
+
+def _write_set_of(folder: str) -> list:
+    """The folder's registry `owns:` globs, else `<folder>/**` (v5.5: the lock unit stays the folder; the set only
+    classifies contention)."""
+    try:
+        for w in lp.load_registry():
+            if (w.home or "") == folder and w.globs:
+                return [str(g) for g in w.globs][:40]
+    except Exception:  # noqa: BLE001
+        pass
+    return [f"{folder}/**"] if folder else ["**"]
+
+
 def _write_lock(lock_file: Path, window: str, task: str, stream: str, status: str, started: str) -> None:
     lock_file.parent.mkdir(parents=True, exist_ok=True)
     branch = _git("symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip() or "detached"
+    folder = _rel_of(lock_file.parent)
+    ws = ", ".join(f"\"{g}\"" for g in _write_set_of(folder))
+    # v5.5 (lock record v2): kind, the bound SESSION (the liveness key — never a pid), the declared write_set, state, ttl
     lock_file.write_text(
         f"holder: interactive\nwindow: \"{window}\"\nstatus: {status}\ntask: \"{task}\"\n"
-        f"stream: \"{stream}\"\nbranch: \"{branch}\"\nstarted: \"{started}\"\n", encoding="utf-8")
+        f"stream: \"{stream}\"\nbranch: \"{branch}\"\nstarted: \"{started}\"\n"
+        f"kind: interactive\nsession: \"{_sid()}\"\nmode: write\nstate: held\nttl_s: {INTERACTIVE_TTL_S}\n"
+        f"write_set: [{ws}]\n", encoding="utf-8")
+
+
+def _commits_since(home: str, started) -> bool:
+    """Did any commit touch `home` since the lock start? (v5.5 no-change release — a git that cannot answer reads as 'changed'.)"""
+    if not started:
+        return True
+    try:
+        r = _git("log", "-1", "--format=%H", f"--since={started.isoformat()}", "--", home or ".")
+        return r.returncode != 0 or bool((r.stdout or "").strip())
+    except Exception:  # noqa: BLE001
+        return True
 
 
 # ----------------------------------------------------------------------------- commands
@@ -416,11 +447,19 @@ def cmd_release(a) -> int:
         print(f"REFUSED: lock held by window={li.window!r}, you are {me.window!r}. --force only with the owner's say-so.")
         return 1
     problems = []
+    # v5.5: the dirty verdict is read FIRST because the pointer check needs it — a shift that changed NOTHING (no commit
+    # since the lock start, no dirty file, pointer untouched) is a clean NO-OP release, never a refusal: a lock that was
+    # only ever read under has nothing to prove (PROTOCOL §1, lock record v2)
+    dirty = _git("status", "--porcelain", "--", home or ".").stdout.strip()
+    no_change = (not dirty) and not _commits_since(home, li.started)
     ptr = ROOT / home / "workflow-state" / "current-pointer.md" if home else ROOT / "workflow-state" / "current-pointer.md"
     if not ptr.is_file():
         problems.append(f"no pointer: {ptr.relative_to(ROOT).as_posix()} does not exist — write it (PROTOCOL §3)")
     elif li.started and datetime.fromtimestamp(ptr.stat().st_mtime) < li.started:
-        problems.append(f"pointer not updated since lock start {li.started.strftime(lp.TS_FMT)}: {ptr.relative_to(ROOT).as_posix()}")
+        if no_change:
+            print(f"note: no-change release of {home or '<root>'} — no commit since the lock start, no uncommitted file, pointer unchanged: nothing to prove")
+        else:
+            problems.append(f"pointer not updated since lock start {li.started.strftime(lp.TS_FMT)}: {ptr.relative_to(ROOT).as_posix()}")
     # §18 (v5.4): the foreground guard — same verdict signoff.py gives, so a bare release cannot walk past it
     if not me.window.lower().startswith("fired-"):
         try:
@@ -458,8 +497,7 @@ def cmd_release(a) -> int:
         ignored = _git("check-ignore", "-q", h).returncode == 0
         if not ignored and _git("status", "--porcelain", "--", h).stdout.strip():
             problems.append(f"handoff {h} is tracked but uncommitted — commit it before releasing")
-    dirty = _git("status", "--porcelain", "--", home or ".").stdout.strip()
-    if dirty and not a.allow_dirty:
+    if dirty and not a.allow_dirty:                        # `dirty` was read above, before the pointer check (v5.5)
         problems.append(f"uncommitted changes under {home or '<root>'} (commit as yourself first):\n" +
                         "\n".join("      " + l for l in dirty.splitlines()[:15]))
     if problems:
