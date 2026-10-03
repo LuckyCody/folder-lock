@@ -239,6 +239,7 @@ def build_board(v: dict, trigger: str, stamps: dict, actor: str, md: str) -> dic
             "ready": len(ready),
             "ready_unlocked": sum(1 for r in ready if not (locks_by_folder.get(r["folder"]) or [])),
             "waiting_owner": len(waiting),
+            "review_open": sum(1 for r in (v.get("deliverables") or []) if r.get("status") == "open"),
             "waiting_world": sum(1 for e in live.values() if e.get("status") == "waiting_world"),
             "in_progress": len(in_progress),
             "parked": sum(1 for e in live.values() if e.get("status") == "parked"),
@@ -248,6 +249,9 @@ def build_board(v: dict, trigger: str, stamps: dict, actor: str, md: str) -> dic
             "digest": len(digest),
         },
         "waiting_owner": waiting,
+        # the review list (v5.6): the bundles for the owner as `deliverables.board_rows` shaped them — title, folder,
+        # summary, since, files, the key the verbs need; a web face reads this array and nothing else
+        "deliverables": v.get("deliverables") or [],
         "in_progress": in_progress,
         "deploys": [d for d in (v.get("deploys") or []) if d.get("pending") or d.get("failed") or d.get("blocked")],
         "digest_since_last_seen": digest,

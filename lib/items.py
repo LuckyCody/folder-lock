@@ -42,6 +42,12 @@ import lockpath as lp  # noqa: E402
 
 ROOT = lp.ROOT
 STATUSES = ("ready", "in_progress", "waiting_owner", "done", "waiting_world", "parked", "filed")
+# A DELIVERABLE (v5.6, PROTOCOL §9): ONE bundle of files an agent wants the owner to look at, registered by the signoff
+# from `<folder>/deliverables/` (`lib/deliverables.py`). `waiting_owner` while it waits for review, `done` when
+# reviewed, `parked` for "later". It has no file-derived row, so a render never closes it (`sync`); it is never
+# fireable (`ready_items`); its `question` IS the one plain sentence the closing message prints.
+DELIVERABLE_KIND = "deliverable"
+STORE_BACKED_KINDS = (DELIVERABLE_KIND,)      # kinds whose only backing is the store record — closed by a verb, never by a render
 OWNER_RE = re.compile(r"\b(owner|ruling|rules?\s+on|approv\w*|decision|decides?|confirm\w*|says)\b", re.I)
 _ARROW = re.compile(r"\s*(?:→|->)\s*")
 # TIMED tripwire condition (v4.3): an ISO instant (date, optional HH:MM, optional zone word) followed by a "has passed"
@@ -456,6 +462,9 @@ def sync(rows: list, data: dict | None = None) -> dict:
         live[k] = e
     for k, e in data["items"].items():
         if k not in live and e.get("status") != "done":
+            if e.get("kind") in STORE_BACKED_KINDS:
+                live[k] = e                 # a deliverable (v5.6) has no row by design — only its own verbs close it
+                continue
             _apply_status(e, "done", None, now)
             e["outcome"] = e.get("outcome") or "left the board (pointer closed / handoff consumed)"
     save(data)
@@ -477,8 +486,9 @@ def from_pointer(folder: str, created_by: str = "") -> tuple[str, dict]:
 
 def ready_items(owner: str | None = None) -> list:
     data = load()
+    # a deliverable is never work for an agent (v5.6): whatever status a writer left it in, no fire starts on it
     out = [dict(key=k, **e) for k, e in data["items"].items()
-           if e.get("status") == "ready" and (owner is None or e.get("owner") == owner)]
+           if e.get("status") == "ready" and (owner is None or e.get("owner") == owner) and e.get("kind") != DELIVERABLE_KIND]
     out.sort(key=lambda e: (0 if e.get("kind") == "pointer" else 1, e.get("created", "")))
     return out
 

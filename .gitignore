@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 .selftest/
+# deliverables for the owner (v5.6, PROTOCOL §9): staging only — the signoff sweeps it into the state store
+**/deliverables/**

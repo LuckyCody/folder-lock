@@ -225,10 +225,15 @@ def build_view() -> dict:
     except Exception:  # noqa: BLE001
         digest = []
     locks = [dict(folder=it["folder"], **lk) for it in folders for lk in it.get("locks", [])]
+    try:                      # v5.6: the bundles for the owner's review — never rows, never questions
+        import deliverables as _dlv
+        review = _dlv.board_rows()
+    except Exception:  # noqa: BLE001
+        review = []
     return {"generated": datetime.now().strftime("%Y-%m-%d %H:%M"), "folders": folders, "deploys": deploys,
             "locks": locks, "items": {"ready": ov["ready"], "in_progress": ov["in_progress"],
                                       "waiting_owner": ov["waiting_owner"], "live": ov["live"]},
-            "digest": digest}
+            "deliverables": review, "digest": digest}
 
 
 # ----------------------------------------------------------------------------- renders
@@ -252,6 +257,21 @@ def _sec_digest(v: dict) -> list:
     if len(dig) > 12:
         rows.insert(0, f"… {len(dig) - 12} older line(s) in the folders' autorun-log.md")
     return _sec(f"✓ autorun since you last looked ({len(dig)} item(s))", rows)
+
+
+def _sec_review(v: dict) -> list:
+    """The bundles waiting for the owner's REVIEW (v5.6, PROTOCOL §9) — one line per open bundle: title · folder · since ·
+    the files, then the summary. Parked and done ones live in board.json (`deliverables`); the verbs are
+    `python lib/deliverables.py done|later|reopen <key>`."""
+    rows = [r for r in (v.get("deliverables") or []) if r.get("status") == "open"]
+    out = []
+    for r in rows:
+        files = ", ".join(f.get("filename", "") for f in (r.get("current_files") or [])) or "-"
+        out.append(_fit(f"{r.get('title', '')} · {r.get('folder', '')} · since {str(r.get('since') or '?')[:16]} · {files}"))
+        if r.get("summary"):
+            out.append(_fit(f"   {r['summary']}"))
+        out.append(_fit(f"   done|later: python lib/deliverables.py done|later {r.get('item_key', '')}"))
+    return _sec("📎 for review (deliverables an agent left for you)", out) if out else []
 
 
 def _sec_waiting(v: dict) -> list:
@@ -337,7 +357,7 @@ def render_full(v: dict) -> str:
     live = [d for d in v["deploys"] if d["pending"] or d["failed"] or d["blocked"]]
     if not v["folders"] and not live:
         return "board: nothing in flight (no locks, pointers, handoffs, or deploy requests)."
-    L = [f"# Open-work board — {v['generated']}"] + _sec_header(v) + _sec_digest(v) + _sec_waiting(v) \
+    L = [f"# Open-work board — {v['generated']}"] + _sec_header(v) + _sec_digest(v) + _sec_waiting(v) + _sec_review(v) \
         + _sec_folders(v) + _sec_locks(v) + _sec_deploys(v)
     return "\n".join(L)
 
@@ -350,7 +370,7 @@ def render_menu(v: dict, kick_note: str = "") -> str:
     if v["items"]["ready"] == 0:
         return render_full(v) + "\n\n◦ exit condition: 0 ready items — everything above waits on the owner or the world (§13)"
     folders = {k.split("|", 1)[0] for k, e in v["items"]["live"].items() if e.get("status") == "ready"}
-    L = _sec_header(v) + _sec_digest(v) + _sec_waiting(v) + _sec_locks(v) + _sec_deploys(v)
+    L = _sec_header(v) + _sec_digest(v) + _sec_waiting(v) + _sec_review(v) + _sec_locks(v) + _sec_deploys(v)
     L += ["", _fit(f"▸ {v['items']['ready']} ready item(s) across {len(folders)} folder(s) are agent work — "
                    f"{kick_note or 'loop not kicked'} · `python scripts/board.py` shows them")]
     return "\n".join(L)

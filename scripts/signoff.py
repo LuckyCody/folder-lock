@@ -326,6 +326,19 @@ def main() -> int:
     sha = a.commit or _git("rev-parse", "--short", "HEAD").stdout.strip()
     print(f"signoff {folder} · window {me.window} · commit {sha}")
 
+    # 0d. deliverables (v5.6, PROTOCOL §9): `<folder>/deliverables/` is swept into the state store's raw objects and
+    #     registered as ONE `deliverable` item per bundle (waiting_owner) — BEFORE the pointer item, so `decide()` and
+    #     the closing message see it in this run. Idempotent (same sha256 → nothing written); never fatal.
+    if not a.dry_run:
+        try:
+            sys.path.insert(0, str(LIB))
+            import deliverables as _dlv
+            for x in _dlv.register(folder, by=me.window, decisions=a.decisions):
+                what = "NEW" if x.get("new") else ("CHANGED" if x.get("changed") else "unchanged")
+                print(f"  deliverables: {what} {x['key'].rsplit('|', 1)[-1]} · {x['title'][:60]} · "
+                      f"{x['files']} file(s), {x['uploaded']} uploaded — for the owner's review")
+        except Exception as e:  # noqa: BLE001
+            print(f"  deliverables: not registered ({type(e).__name__}: {e}) — the files stay in deliverables/ for the next signoff")
     # 1. the pointer just written becomes the board item
     if not a.dry_run:
         r = _py(str(LIB / "items.py"), "from-pointer", folder)
